@@ -1,39 +1,43 @@
-# Darvas RS Screener v6.1 — Quick Presets & TypeError fix
+# Darvas RS Screener v7 — Recommended One-Click Presets
 
-Streamlit dashboard for StockCharts SCTR imports (CSV or copied SCTR Reports table), weekly/daily Darvas and VCP screening, and first pullback to a 20-week moving average. Yahoo Finance supplies adjusted historical OHLCV. This is **not real-time data** and is **not a backtesting engine**.
+A dark-mode Streamlit technical screener for **Darvas breakout**, **tight-base/VCP pre-breakout**, and **first pullback to the weekly 20 EMA**. It uses historical Yahoo Finance OHLCV and manually imported StockCharts SCTR snapshots. Not a real-time feed, portfolio backtester, or trade execution system.
 
-## What's fixed in v6.1
+## What's new in v7
 
-- **`TypeError` on `Rules(...)`:** `app.py` and `screener_core.py` now have matching interfaces. An explicit API version handshake checks `screener_core.py` and `pullback_core.py` **before downloading any market data** and shows helpful instructions instead of an opaque Python traceback if one module is stale.
-- Three **Quick Presets** immediately visible:
-  1. **Darvas Breakout** — classical high-of-box breakout with 4% minimum breakout clearance, close-strength/volume/EMA/MACD confirmation; default Weekly but Daily available.
-  2. **VCP Pre-Breakout** — final contraction smaller than the preceding range, approaching final local pivot; default Weekly but Daily available. An experimental mechanical contraction proxy, not a guaranteed VCP pattern.
-  3. **First Pullback EMA 20W** — Weekly only; first approach, touch or confirmed rebound after a prior breakout and upward impulse.
-- A single **Advanced Filters — optional** panel, closed by default, contains the rest of the inputs: pattern type, exchange, Darvas, VCP, pullback and additional RS settings.
-- Selecting a new preset clears results from the previous preset; no misleading old results shown.
-- The default scan limit is **500 tickers**, enough for a typical pasted SCTR list. Scans can take time and Yahoo may rate-limit.
-- Keeps user-requested removals: **no Market Cap filter**, no **Barchart**, **Quality**, or **Growth** fields/columns.
-- Preserves the dark theme, hover charts and diagnostic candidate explorer.
+The three **recommended presets now actually configure every filter**, rather than just selecting the strategy's name. Switching a preset or clicking **↺ Reaplică presetul** sets the inputs to their recommended values and clears out results from the previous configuration. Open **⚙ Advanced Filters — optional** to change anything; a `ⓘ` help icon explains each filter with an example.
 
-## Install / update an existing GitHub repository
+| Preset | Starting rule settings |
+| --- | --- |
+| **Darvas Breakout** | **Weekly**; SCTR ≥70; RS 3M outperform SPY; freshness **2 completed weeks**; long breakout; consolidation 6–16 bars, width ≤20%; close ≥**1% and ≤10%** above resistance; close strength ≥75%; volume ≥previous bar +1%; EMA20 and MACD confirmation on; max technical entry-to-stop 16% |
+| **VCP Pre-Breakout** | **Weekly**; SCTR ≥70; RS 3M outperform SPY; latest **3 completed weeks** considered; **pre-breakout only**; base ≥4 bars; final contraction ≤12%; latest/previous range ≤0.80; latest/previous True Range ≤0.95; **volume dry-up ON** with ratio ≤0.90; close to local pivot (within 5%); EMA confirmation on, MACD off |
+| **First Pullback EMA 20W** | **Weekly only**; SCTR ≥70; RS 3M outperform SPY; freshness 3; breakout over previous 8-week high by at least 0.5%; ≥3 weeks of uptrend; ≥8% impulse; first EMA20W approach/touch/bounce; ±touch tolerance +2%/−2.5%, WATCH up to +5%; stop offset 0.5%; max technical entry-to-stop 16% |
 
-1. Download and **unzip the release**.
-2. In `OanaSonic/darvas-rs-screener`, use **Add file → Upload files** and upload the **files inside the extracted ZIP** (do not upload the ZIP itself). Commit the changes to branch `main`.
-3. **Replace ALL five Python files together**: `app.py`, `screener_core.py`, `pullback_core.py`, `hover_chart.py`, and `sctr_paste.py`; also upload `requirements.txt` and `.streamlit/config.toml` as supplied. The two `*_core.py` files are mandatory; do not mix v6.1 `app.py` with older modules.
-4. Streamlit Cloud should redeploy the `app.py` entrypoint after GitHub commits. If the older version remains, use **Manage app → Reboot** and inspect logs. Paste SCTR table again if the app session resets.
-5. For the previous `TypeError`, if the new version shows a version-mismatch warning, confirm `screener_core.py` and `pullback_core.py` were uploaded **to the repository root**, not a subfolder and not as `filename (1).py`.
+All preset thresholds are **initial research settings**, not verified optimal trade-entry parameters. The SCTR filter is switched on automatically when the selected stock universe is **Imported SCTR list**. If the user scans a different universe and has not imported SCTR values, the SCTR requirement defaults off.
 
-## Quick use
+## Personal presets (no authentication)
 
-- Paste the copied table in the **Paste SCTR Reports — fără CSV** sidebar expander, and select **Imported SCTR list**. The data are a timestamp-less snapshot from StockCharts; replace periodically.
-- Choose one of the three presets. Set the benchmark and (optionally) the signal freshness, SCTR minimum and RS filter.
-- Click **RUN SCREENER**. The green/red signals, charts and result exports come from current available historical OHLCV; missing tickers are not invented.
-- To customize close strength, VCP range, other indicators, etc., open **Advanced Filters — optional**. It stays closed unless needed.
+1. Choose a recommended preset.
+2. Optionally adjust **⚙ Advanced Filters** and/or the quick filters.
+3. At the bottom of the form, expand **💾 Salvează propriul profil**, type a name, then click **💾 Salvează profil**.
+4. The new profile appears with a `★` prefix under **Alege strategia** (after the next rerun). Select it to restore **all** values.
+5. To keep profiles after app restart, use **StockCharts sidebar → 💾 Profiluri personale → Exportă profilurile mele (JSON)**. Import the exported `.json` file later.
 
-## Data and strategy caveats
+Saving to the browser session is **not permanent storage**; the JSON export is needed to persist a personal profile across Streamlit session resets. No login or database is involved.
 
-A `BOUNCE CONFIRMED` signal is a research flag and not an executable buy order. Weekly scans exclude the current incomplete week. RS percentile is computed within the downloaded universe; SCTR is taken from imported StockCharts text or CSV. Yahoo data can be delayed, rate-limited or incomplete. Any backtested returns in the cited video are third-party claims, not reproduced by this screener. None of the displayed signals constitutes investment advice.
+## Update your existing Streamlit Cloud app
 
-## Tests
+1. Download and extract the ZIP, don't upload the ZIP itself.
+2. Go to your existing GitHub repository `OanaSonic/darvas-rs-screener` and use **Add file → Upload files**.
+3. **Replace all files as a matched set**: `app.py`, `screener_core.py`, `pullback_core.py`, `hover_chart.py`, `sctr_paste.py`, `requirements.txt`. **Add the new `preset_profiles.py`** at the same root level as `app.py`. Keep `.streamlit/config.toml` or upload it from this ZIP.
+4. Commit and reload Streamlit; use **Manage app → Reboot** if it shows an old build.
+5. Paste your StockCharts SCTR table, choose `Imported SCTR list`, pick a preset and click **RUN SCREENER**.
 
-Run `python -m pytest -q` (requires `pytest`, `numpy`, `pandas`). All source files can be compiled with `python -m compileall -q .`. Streamlit Cloud / Yahoo network deployment must still be checked in the user's environment.
+`app.py`, `screener_core.py` and `pullback_core.py` still share the **v6.1 engine API version**. Do not mix the new UI with older engine modules.
+
+## Testing
+
+Run `python -m pytest -q` from the extracted repository for unit tests (requires pandas/numpy/pytest). Tests verify recommended values, validation, custom profile export/import, Streamlit widget wiring, and legacy Darvas/VCP/pullback logic. Live Yahoo download and Streamlit Cloud deployment cannot be tested in this offline environment.
+
+## Data and risk caveats
+
+Yahoo Finance OHLCV is delayed/EOD, may be incomplete or rate-limited and adjusts historical prices. StockCharts SCTR copied from a table is a manual snapshot, not a live score. The screener offers signals for further manual verification; it does not place orders or determine a suitable position size. Historical video returns are not reproduced by the app.

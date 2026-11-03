@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import StringIO
+import copy
 import re
 from zoneinfo import ZoneInfo
 
@@ -20,8 +21,10 @@ from screener_core import Rules, normalized, find_setup, annotate_percentile, pa
 from pullback_core import PullbackRules, first_pullback_setup
 from hover_chart import render_results
 from sctr_paste import parse_sctr_paste
+from preset_profiles import (RECOMMENDED_PRESETS, DEFAULT_FILTERS, FIELD_HELP,
+    recommended_profile, validate_profile, export_user_profiles, import_user_profiles)
 
-st.set_page_config(page_title='DARVAS RS | Quick Presets & Weekly Pullback',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
+st.set_page_config(page_title='DARVAS RS | Recommended Presets & Weekly Pullback',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
 
 BG='#0b1018'; PANEL='#131b26'; GREEN='#27d09a'; MUTED='#a7b9cd'
 STYLE=r"""
@@ -196,10 +199,15 @@ st.markdown('''<div style="display:flex;gap:15px;align-items:center;margin:0 0 5
 <div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner</div>
 </div><div style="color:#aec2d4;margin-bottom:14px">Darvas Breakout · VCP Pre-Breakout · First Pullback EMA 20W · RS vs SPY/SPX · hover charts</div>''',unsafe_allow_html=True)
 
+def _universe_changed():
+    # SCTR enforcement follows the selected universe; users may override afterward.
+    st.session_state['filter_sctr_on']=st.session_state.get('universe_choice')=='Imported SCTR list'
+    st.session_state.pop('results',None)
+
 with st.sidebar:
     st.header('Data & universe')
     st.caption('Public Yahoo Finance OHLCV (adjusted), cached 15 min. NOT guaranteed real-time.')
-    universe=st.selectbox('Stock universe',['Starter (growth leaders)','S&P 500','Nasdaq-100','Imported SCTR list','Custom list'])
+    universe=st.selectbox('Stock universe',['Starter (growth leaders)','S&P 500','Nasdaq-100','Imported SCTR list','Custom list'],key='universe_choice',on_change=_universe_changed,help='Universul din care selectăm acțiunile. Imported SCTR list folosește tickerele din raportul StockCharts lipit.')
     ticker_text=st.text_area('Additional / custom tickers',height=105,placeholder='NVDA, PLTR, ANET, VRT, ...')
     max_symbols=st.number_input('Max tickers to scan',min_value=10,max_value=650,value=500,step=25)
     st.divider()
@@ -223,151 +231,191 @@ with st.sidebar:
                 st.download_button('↓ Descarcă SCTR ca CSV',as_csv.to_csv(index=False).encode('utf-8-sig'),file_name='stockcharts_sctr_import.csv',mime='text/csv')
             else:st.warning(pasted_message)
     st.caption('SCTR este un snapshot din StockCharts; nu reprezintă date live. Poți relipi tabelul când vrei să îl actualizezi.')
+    st.session_state.setdefault('user_profiles', {})
+    with st.expander('💾 Profiluri personale · import / export',expanded=False):
+        st.caption('Setările salvate în această sesiune pot fi exportate într-un JSON și restaurate ulterior, fără cont sau autentificare.')
+        profile_upload=st.file_uploader('Importă profiluri salvate (.json)',type=['json'],key='my_profiles_upload')
+        if profile_upload:
+            try:
+                incoming=import_user_profiles(profile_upload.getvalue())
+                profile_fingerprint=(profile_upload.name,len(profile_upload.getvalue()),profile_upload.getvalue())
+                if st.session_state.get('_profiles_upload_fingerprint')!=profile_fingerprint:
+                    st.session_state['user_profiles'].update(incoming)
+                    st.session_state['_profiles_upload_fingerprint']=profile_fingerprint
+                    st.success(f'{len(incoming)} profiluri importate.')
+            except (ValueError,UnicodeDecodeError,KeyError,TypeError) as ex:
+                st.warning(f'Fișier de profil nevalid: {ex}')
+        if st.session_state['user_profiles']:
+            st.download_button('↓ Exportă profilurile mele (JSON)',
+                export_user_profiles(st.session_state['user_profiles']).encode('utf-8'),
+                file_name='darvas_my_presets.json',mime='application/json',use_container_width=True)
+            st.caption(f"{len(st.session_state['user_profiles'])} profiluri personale în această sesiune")
     st.divider()
     st.caption('TIP: Hover over a result ticker to see the actual price chart, EMA, box, volume and RS.')
 
 
-# Presets are selected OUTSIDE the form, so the chosen strategy is visible and
-# a change immediately rebuilds the settings with that preset's defaults.
-PRESETS = {
-    'Darvas Breakout': {
-        'timeframe':'Weekly','strategy':'Darvas + VCP','pattern_family':'Darvas',
-        'mode':'Breakout','lookback':3,'breakout_min':4.0,'close_strength':75,
-        'min_volume':1.0,'ema_on':True,'macd_on':True,
-    },
-    'VCP Pre-Breakout': {
-        'timeframe':'Weekly','strategy':'Darvas + VCP','pattern_family':'VCP',
-        'mode':'Near breakout','lookback':3,'breakout_min':4.0,
-        'close_strength':60,'min_volume':0.0,'ema_on':True,'macd_on':False,
-    },
-    'First Pullback EMA 20W': {
-        'timeframe':'Weekly','strategy':'First Pullback to 20W MA','pattern_family':'Both',
-        'mode':'Both','lookback':3,'breakout_min':4.0,'close_strength':75,
-        'min_volume':1.0,'ema_on':True,'macd_on':True,
-    },
-}
+# Recommended presets set ALL underlying widgets, not only the strategy title.
+# Streamlit callback runs before widgets are instantiated on the new rerun.
+STOCKCHARTS_SELECTED = universe == 'Imported SCTR list'
 
-st.markdown('### Quick strategy presets')
-preset_name=st.selectbox('Choose your setup',list(PRESETS),
-    help='A preset gives recommended starting parameters, not a validated trading signal. Open Advanced Filters to customize.')
-preset=PRESETS[preset_name]
-if st.session_state.get('_active_scan_preset') != preset_name:
-    st.session_state.pop('results', None)  # Do not show results from a different preset.
-    st.session_state['_active_scan_preset'] = preset_name
-st.caption({
-    'Darvas Breakout': 'Completed weekly/daily close above the high of the prior box; classic breakout confirmation.',
-    'VCP Pre-Breakout': 'Late tight consolidation after a wider range; search before the local pivot is broken.',
-    'First Pullback EMA 20W': 'Weekly only: breakout, several weeks of advance, and first return toward the rising 20-week EMA.',
-}[preset_name])
+def _profile_base(name: str) -> str:
+    if name in RECOMMENDED_PRESETS:
+        return name
+    if name.startswith('★ ') and name[2:] in st.session_state.get('user_profiles',{}):
+        return st.session_state['user_profiles'][name[2:]]['base']
+    return 'Darvas Breakout'
 
-with st.form('scan_settings_'+preset_name.replace(' ','_')):
+def _apply_profile() -> None:
+    name=st.session_state.get('preset_choice','Darvas Breakout')
+    base=_profile_base(name)
+    if name.startswith('★ ') and name[2:] in st.session_state.get('user_profiles',{}):
+        config=validate_profile(base,st.session_state['user_profiles'][name[2:]]['filters'])
+    else:
+        config=recommended_profile(base,imported_sctr=st.session_state.get('_universe_for_preset')=='Imported SCTR list')
+    for field,value in config.items():
+        st.session_state['filter_'+field]=copy.deepcopy(value)
+    st.session_state['_active_scan_preset']=name
+    st.session_state.pop('results',None)  # Never display results for a different profile.
+
+st.session_state['_universe_for_preset']=universe
+st.session_state.setdefault('preset_choice','Darvas Breakout')
+all_profiles=list(RECOMMENDED_PRESETS)+['★ '+name for name in st.session_state['user_profiles']]
+if st.session_state['preset_choice'] not in all_profiles:
+    st.session_state['preset_choice']='Darvas Breakout'
+if (st.session_state.get('_active_scan_preset')!=st.session_state['preset_choice']
+        or any('filter_'+field not in st.session_state for field in DEFAULT_FILTERS)):
+    _apply_profile()
+st.markdown('### Quick strategy presets · valori recomandate')
+c_preset,c_reset=st.columns([4,1])
+with c_preset:
+    preset_name=st.selectbox('Alege strategia',all_profiles,key='preset_choice',on_change=_apply_profile,
+        help='Alegerea unui preset aplică automat toate filtrele. Modificările ulterioare se fac în Advanced Filters.')
+with c_reset:
+    st.write('')
+    st.button('↺ Reaplică presetul',on_click=_apply_profile,use_container_width=True,
+        help='Restabilește toate filtrele profilului selectat la valorile salvate/recomandate.')
+base_name=_profile_base(preset_name)
+preset=RECOMMENDED_PRESETS[base_name]
+if preset_name.startswith('★ '):
+    st.caption(f"Profil personal · bazat pe {base_name}. Filtrele lui pot fi modificate și salvate din nou.")
+else:
+    st.caption(preset['description'])
+st.caption('Presetările sunt puncte de plecare pentru screening, nu semnale de tranzacționare validate prin backtest.')
+
+with st.form('scan_settings'):
     st.markdown('### 01 · Quick filters')
     q1,q2,q3,q4=st.columns(4)
     with q1:
-        timeframe=st.selectbox('Chart timeframe', ['Weekly'] if preset_name=='First Pullback EMA 20W' else ['Weekly','Daily'],
-            index=0, help='The first pullback strategy is always WEEKLY.')
-    with q2:benchmark=st.selectbox('RS benchmark',['SPY','SPX (^GSPC)'])
-    with q3:lookback=st.selectbox('Signal freshness · completed bars',[1,2,3,5,10,20],index=2,
-        help='A breakout/bounce must have occurred within the last N completed candles.')
-    with q4:sctr_min=st.number_input('Min SCTR (StockCharts)',min_value=0,max_value=100,value=70)
+        timeframe=st.selectbox('Chart timeframe', ['Weekly'] if base_name == 'First Pullback EMA 20W' else ['Weekly', 'Daily'], help=FIELD_HELP['timeframe'], key='filter_timeframe')
+    with q2:benchmark=st.selectbox('RS benchmark', ['SPY', 'SPX (^GSPC)'], key='filter_benchmark', help=FIELD_HELP['benchmark'])
+    with q3:lookback=st.selectbox('Signal freshness · completed bars', [1, 2, 3, 5, 10, 20], help=FIELD_HELP['lookback'], key='filter_lookback')
+    with q4:sctr_min=st.number_input('Min SCTR (StockCharts)', min_value=0, max_value=100, key='filter_sctr_min', help=FIELD_HELP['sctr_min'])
     q5,q6=st.columns([1.9,1.1])
-    with q5:rs_mode=st.selectbox('Relative Strength filter',
-        ['3M outperform','Off','52w RS high','3M outperform + 52w high'],
-        help='3M outperformance uses the stock/benchmark ratio, not absolute stock return.')
-    with q6:sctr_on=st.checkbox('Require imported SCTR',value=(universe=='Imported SCTR list'),
-        help='Stocks without imported SCTR are excluded when enabled.')
+    with q5:rs_mode=st.selectbox('Relative Strength filter', ['3M outperform', 'Off', '52w RS high', '3M outperform + 52w high'], help=FIELD_HELP['rs_mode'], key='filter_rs_mode')
+    with q6:sctr_on=st.checkbox('Require imported SCTR', help=FIELD_HELP['sctr_on'], key='filter_sctr_on')
     st.caption('All other criteria are configured for the selected strategy. Expand only if you need to customize them.')
 
     with st.expander('⚙ Advanced Filters — optional',expanded=False):
         st.markdown('#### Universe, pattern & signal filters')
         x1,x2,x3=st.columns(3)
         with x1:
-            direction=st.selectbox('Direction',['Long','Short'] if preset_name=='Darvas Breakout' else ['Long'])
+            direction=st.selectbox('Direction', ['Long', 'Short'] if base_name == 'Darvas Breakout' else ['Long'], key='filter_direction', help=FIELD_HELP['direction'])
         with x2:
             mode_options=['Both (Breakout + Pre-Breakout)','Breakout only','Pre-Breakout only','All incl. Inside Box']
-            default_label={'Breakout':'Breakout only','Near breakout':'Pre-Breakout only',
-                'Both':'Both (Breakout + Pre-Breakout)','All setups':'All incl. Inside Box'}[preset['mode']]
-            mode_label=st.selectbox('Signal type',mode_options,index=mode_options.index(default_label))
+            mode_label=st.selectbox('Signal type', mode_options, key='filter_mode_label', help=FIELD_HELP['mode_label'])
         with x3:
             families=['Darvas Box only','Tight Base / VCP only','Both (Darvas + Tight VCP)']
-            family_label={'Darvas':'Darvas Box only','VCP':'Tight Base / VCP only',
-                'Both':'Both (Darvas + Tight VCP)'}[preset['pattern_family']]
-            family_choice=st.selectbox('Pattern family',families,index=families.index(family_label),
-                disabled=preset_name=='First Pullback EMA 20W',
-                help='For the pullback strategy, the initial breakout is detected by the pullback engine.')
+            family_choice=st.selectbox('Pattern family', families, disabled=base_name == 'First Pullback EMA 20W', help=FIELD_HELP['family_choice'], key='filter_family_choice')
         mode={'Both (Breakout + Pre-Breakout)':'Both','Breakout only':'Breakout',
               'Pre-Breakout only':'Near breakout','All incl. Inside Box':'All setups'}[mode_label]
         pattern_family={'Darvas Box only':'Darvas','Tight Base / VCP only':'VCP',
                         'Both (Darvas + Tight VCP)':'Both'}[family_choice]
         strategy=preset['strategy']
-        exchange_filter=st.multiselect('Exchange filter (empty = no exchange lookup)',
-            ['NASDAQ','NYSE','AMEX','NYSE Arca'],default=[])
+        exchange_filter=st.multiselect('Exchange filter (empty = no exchange lookup)', ['NASDAQ', 'NYSE', 'AMEX', 'NYSE Arca'], key='filter_exchange_filter', help=FIELD_HELP['exchange_filter'])
         if direction=='Short' and pattern_family in ('VCP','Both'):
             st.caption('Short signals are evaluated by Darvas only. The VCP model detects long setups.')
 
         st.markdown('#### Darvas Box · breakout confirmation')
         b1,b2,b3,b4=st.columns(4)
-        with b1:min_bars=st.number_input('Minimum consolidation bars',min_value=3,max_value=52,value=6)
-        with b2:max_bars=st.number_input('Maximum consolidation bars',min_value=3,max_value=80,value=16)
-        with b3:max_box=st.number_input('Maximum box range (%)',min_value=1.0,max_value=100.0,value=20.0,step=1.0)
-        with b4:stop_pos=st.number_input('Stop inside box from bottom (%)',min_value=0,max_value=100,value=33)
+        with b1:min_bars=st.number_input('Minimum consolidation bars', min_value=3, max_value=52, key='filter_min_bars', help=FIELD_HELP['min_bars'])
+        with b2:max_bars=st.number_input('Maximum consolidation bars', min_value=3, max_value=80, key='filter_max_bars', help=FIELD_HELP['max_bars'])
+        with b3:max_box=st.number_input('Maximum box range (%)', min_value=1.0, max_value=100.0, step=1.0, key='filter_max_box', help=FIELD_HELP['max_box'])
+        with b4:stop_pos=st.number_input('Stop inside box from bottom (%)', min_value=0, max_value=100, key='filter_stop_pos', help=FIELD_HELP['stop_pos'])
         c1,c2,c3,c4=st.columns(4)
-        with c1:max_risk=st.number_input('Maximum stop-loss risk (%)',min_value=1.0,max_value=100.0,value=16.0)
-        with c2:breakout_min=st.number_input('Darvas breakout clearance MIN (%)',min_value=0.0,max_value=40.0,value=preset['breakout_min'],step=0.5)
-        with c3:breakout_max=st.number_input('Breakout clearance MAX (%)',min_value=0.5,max_value=1000.0,value=1000.0,step=1.0)
-        with c4:close_strength=st.number_input('Minimum close strength (%)',min_value=0,max_value=100,value=preset['close_strength'])
+        with c1:max_risk=st.number_input('Maximum stop-loss risk (%)', min_value=1.0, max_value=100.0, key='filter_max_risk', help=FIELD_HELP['max_risk'])
+        with c2:breakout_min=st.number_input('Darvas breakout clearance MIN (%)', min_value=0.0, max_value=40.0, step=0.5, key='filter_breakout_min', help=FIELD_HELP['breakout_min'])
+        with c3:breakout_max=st.number_input('Breakout clearance MAX (%)', min_value=0.5, max_value=1000.0, step=1.0, key='filter_breakout_max', help=FIELD_HELP['breakout_max'])
+        with c4:close_strength=st.number_input('Minimum close strength (%)', min_value=0, max_value=100, key='filter_close_strength', help=FIELD_HELP['close_strength'])
         d1,d2,d3,d4=st.columns(4)
-        with d1:min_volume=st.number_input('Minimum volume increase vs prior bar (%)',min_value=-100.0,max_value=1000.0,value=preset['min_volume'])
-        with d2:entry_buffer=st.number_input('Entry buffer beyond close (%)',min_value=0.0,max_value=10.0,value=0.01,step=0.01,format='%.2f')
-        with d3:ema_on=st.checkbox('20 EMA confirmation',value=preset['ema_on'])
-        with d4:macd_on=st.checkbox('MACD above signal (long)',value=preset['macd_on'])
+        with d1:min_volume=st.number_input('Minimum volume increase vs prior bar (%)', min_value=-100.0, max_value=1000.0, key='filter_min_volume', help=FIELD_HELP['min_volume'])
+        with d2:entry_buffer=st.number_input('Entry buffer beyond close (%)', min_value=0.0, max_value=10.0, step=0.01, format='%.2f', key='filter_entry_buffer', help=FIELD_HELP['entry_buffer'])
+        with d3:ema_on=st.checkbox('20 EMA confirmation', key='filter_ema_on', help=FIELD_HELP['ema_on'])
+        with d4:macd_on=st.checkbox('MACD above signal (long)', key='filter_macd_on', help=FIELD_HELP['macd_on'])
         e1,e2,e3,e4=st.columns(4)
-        with e1:touches=st.number_input('Minimum resistance/support touches',min_value=1,max_value=8,value=1)
-        with e2:touch_tol=st.number_input('Touch tolerance (%)',min_value=0.1,max_value=10.0,value=2.5,step=0.5)
-        with e3:near_distance=st.number_input('Pre-Breakout: max distance (%)',min_value=0.1,max_value=30.0,value=5.0)
-        with e4:max_inside_distance=st.number_input('Inside box: max gap (%)',min_value=5.0,max_value=100.0,value=20.0)
+        with e1:touches=st.number_input('Minimum resistance/support touches', min_value=1, max_value=8, key='filter_touches', help=FIELD_HELP['touches'])
+        with e2:touch_tol=st.number_input('Touch tolerance (%)', min_value=0.1, max_value=10.0, step=0.5, key='filter_touch_tol', help=FIELD_HELP['touch_tol'])
+        with e3:near_distance=st.number_input('Pre-Breakout: max distance (%)', min_value=0.1, max_value=30.0, key='filter_near_distance', help=FIELD_HELP['near_distance'])
+        with e4:max_inside_distance=st.number_input('Inside box: max gap (%)', min_value=5.0, max_value=100.0, key='filter_max_inside_distance', help=FIELD_HELP['max_inside_distance'])
         e5,e6,e7=st.columns([2,1.7,1.6])
-        with e5:resistance_basis=st.selectbox('Darvas resistance method',
-            ['Highest wick (range box)','Highest close (early-warning, non-classic)'],index=0)
-        with e6:confirmed_pivot=st.checkbox('Require 3 lower highs after pivot',value=False)
-        with e7:completed_only=st.checkbox('Completed candles only',value=True)
+        with e5:resistance_basis=st.selectbox('Darvas resistance method', ['Highest wick (range box)', 'Highest close (early-warning, non-classic)'], key='filter_resistance_basis', help=FIELD_HELP['resistance_basis'])
+        with e6:confirmed_pivot=st.checkbox('Require 3 lower highs after pivot', key='filter_confirmed_pivot', help=FIELD_HELP['confirmed_pivot'])
+        with e7:completed_only=st.checkbox('Completed candles only', key='filter_completed_only', help=FIELD_HELP['completed_only'])
 
         st.markdown('#### Tight Base / VCP · last contraction')
         st.caption('Late N-bar range compared with the previous N bars; local pivot = high of FINAL contraction.')
         v1,v2,v3,v4=st.columns(4)
-        with v1:vcp_tight=st.number_input('VCP max final box width (%)',min_value=1.0,max_value=40.0,value=12.0,step=1.0)
-        with v2:vcp_range=st.number_input('Latest / earlier range max ratio',min_value=0.1,max_value=1.0,value=0.8,step=0.05)
-        with v3:vcp_atr=st.number_input('Latest / earlier avg TR max ratio',min_value=0.1,max_value=1.5,value=0.95,step=0.05)
-        with v4:vcp_clear=st.number_input('VCP breakout above pivot MIN (%)',min_value=0.0,max_value=10.0,value=0.15,step=0.05)
+        with v1:vcp_tight=st.number_input('VCP max final box width (%)', min_value=1.0, max_value=40.0, step=1.0, key='filter_vcp_tight', help=FIELD_HELP['vcp_tight'])
+        with v2:vcp_range=st.number_input('Latest / earlier range max ratio', min_value=0.1, max_value=1.0, step=0.05, key='filter_vcp_range', help=FIELD_HELP['vcp_range'])
+        with v3:vcp_atr=st.number_input('Latest / earlier avg TR max ratio', min_value=0.1, max_value=1.5, step=0.05, key='filter_vcp_atr', help=FIELD_HELP['vcp_atr'])
+        with v4:vcp_clear=st.number_input('VCP breakout above pivot MIN (%)', min_value=0.0, max_value=10.0, step=0.05, key='filter_vcp_clear', help=FIELD_HELP['vcp_clear'])
         v5,v6,v7=st.columns(3)
-        with v5:vcp_dry=st.checkbox('Require VCP volume dry-up',value=False)
-        with v6:vcp_vol=st.number_input('Max latest / earlier volume ratio',min_value=0.1,max_value=2.0,value=0.9,step=0.05)
-        with v7:vcp_stop=st.number_input('VCP stop buffer below base low (%)',min_value=0.0,max_value=5.0,value=0.3,step=0.1)
+        with v5:vcp_dry=st.checkbox('Require VCP volume dry-up', key='filter_vcp_dry', help=FIELD_HELP['vcp_dry'])
+        with v6:vcp_vol=st.number_input('Max latest / earlier volume ratio', min_value=0.1, max_value=2.0, step=0.05, key='filter_vcp_vol', help=FIELD_HELP['vcp_vol'])
+        with v7:vcp_stop=st.number_input('VCP stop buffer below base low (%)', min_value=0.0, max_value=5.0, step=0.1, key='filter_vcp_stop', help=FIELD_HELP['vcp_stop'])
 
         st.markdown('#### First Pullback · Weekly 20 MA')
         st.caption('Only active for First Pullback EMA 20W preset. WATCH is not a confirmed entry.')
         pb1,pb2,pb3,pb4=st.columns(4)
-        with pb1:pb_ma=st.selectbox('20-week moving average',['EMA','SMA'])
-        with pb2:pb_stage=st.selectbox('Pullback stage',['All','Watch','First touch','Bounce'])
-        with pb3:pb_upweeks=st.number_input('Weeks of uptrend after breakout MIN',min_value=2,max_value=10,value=3)
-        with pb4:pb_maxweeks=st.number_input('Max weeks since breakout',min_value=4,max_value=36,value=16)
+        with pb1:pb_ma=st.selectbox('20-week moving average', ['EMA', 'SMA'], key='filter_pb_ma', help=FIELD_HELP['pb_ma'])
+        with pb2:pb_stage=st.selectbox('Pullback stage', ['All', 'Watch', 'First touch', 'Bounce'], key='filter_pb_stage', help=FIELD_HELP['pb_stage'])
+        with pb3:pb_upweeks=st.number_input('Weeks of uptrend after breakout MIN', min_value=2, max_value=10, key='filter_pb_upweeks', help=FIELD_HELP['pb_upweeks'])
+        with pb4:pb_maxweeks=st.number_input('Max weeks since breakout', min_value=4, max_value=36, key='filter_pb_maxweeks', help=FIELD_HELP['pb_maxweeks'])
         pb5,pb6,pb7,pb8=st.columns(4)
-        with pb5:pb_advance=st.number_input('Impulse gain above breakout MIN (%)',min_value=2.0,max_value=100.0,value=8.0,step=1.0)
-        with pb6:pb_touch=st.number_input('First MA touch tolerance (%)',min_value=0.0,max_value=10.0,value=2.0,step=0.5)
-        with pb7:pb_watch=st.number_input('Watch: low above MA max gap (%)',min_value=2.0,max_value=20.0,value=5.0,step=0.5)
-        with pb8:pb_undercut=st.number_input('Max low undercut below MA (%)',min_value=0.0,max_value=12.0,value=2.5,step=0.5)
+        with pb5:pb_advance=st.number_input('Impulse gain above breakout MIN (%)', min_value=2.0, max_value=100.0, step=1.0, key='filter_pb_advance', help=FIELD_HELP['pb_advance'])
+        with pb6:pb_touch=st.number_input('First MA touch tolerance (%)', min_value=0.0, max_value=10.0, step=0.5, key='filter_pb_touch', help=FIELD_HELP['pb_touch'])
+        with pb7:pb_watch=st.number_input('Watch: low above MA max gap (%)', min_value=2.0, max_value=20.0, step=0.5, key='filter_pb_watch', help=FIELD_HELP['pb_watch'])
+        with pb8:pb_undercut=st.number_input('Max low undercut below MA (%)', min_value=0.0, max_value=12.0, step=0.5, key='filter_pb_undercut', help=FIELD_HELP['pb_undercut'])
         pb9,pb10,pb11,pb12=st.columns(4)
-        with pb9:pb_breakperiod=st.number_input('Pre-breakout highest-high window (weeks)',min_value=4,max_value=20,value=8)
-        with pb10:pb_breakclear=st.number_input('Prior breakout close above high (%)',min_value=0.0,max_value=10.0,value=0.5,step=0.25)
-        with pb11:pb_stop=st.number_input('Stop below touch-week low (%)',min_value=0.0,max_value=10.0,value=0.5,step=0.25)
-        with pb12:pb_risk=st.number_input('Pullback maximum entry risk (%)',min_value=1.0,max_value=40.0,value=16.0,step=1.0)
+        with pb9:pb_breakperiod=st.number_input('Pre-breakout highest-high window (weeks)', min_value=4, max_value=20, key='filter_pb_breakperiod', help=FIELD_HELP['pb_breakperiod'])
+        with pb10:pb_breakclear=st.number_input('Prior breakout close above high (%)', min_value=0.0, max_value=10.0, step=0.25, key='filter_pb_breakclear', help=FIELD_HELP['pb_breakclear'])
+        with pb11:pb_stop=st.number_input('Stop below touch-week low (%)', min_value=0.0, max_value=10.0, step=0.25, key='filter_pb_stop', help=FIELD_HELP['pb_stop'])
+        with pb12:pb_risk=st.number_input('Pullback maximum entry risk (%)', min_value=1.0, max_value=40.0, step=1.0, key='filter_pb_risk', help=FIELD_HELP['pb_risk'])
 
         st.markdown('#### Additional RS thresholds')
         f1,f2=st.columns(2)
-        with f1:rs_min=st.number_input('Min 3M outperformance vs benchmark (%)',min_value=-100.0,max_value=1000.0,value=0.0,step=1.0)
-        with f2:rs_pctl=st.number_input('Min RS rank percentile in scanned universe',min_value=0,max_value=100,value=0,step=5)
+        with f1:rs_min=st.number_input('Min 3M outperformance vs benchmark (%)', min_value=-100.0, max_value=1000.0, step=1.0, key='filter_rs_min', help=FIELD_HELP['rs_min'])
+        with f2:rs_pctl=st.number_input('Min RS rank percentile in scanned universe', min_value=0, max_value=100, step=5, key='filter_rs_pctl', help=FIELD_HELP['rs_pctl'])
 
-    submitted=st.form_submit_button('▶ RUN SCREENER',type='primary',use_container_width=True)
+    with st.expander('💾 Salvează propriul profil — opțional',expanded=False):
+        st.caption('Editează filtrele de mai sus, scrie un nume și salvează. Pentru a-l păstra după repornirea aplicației, exportă JSON din sidebar.')
+        profile_to_save=st.text_input('Nume profil personal',placeholder='Ex.: VCP conservator',key='profile_new_name')
+    run_col,save_col=st.columns([3,1])
+    with run_col:submitted=st.form_submit_button('▶ RUN SCREENER',type='primary',use_container_width=True)
+    with save_col:save_profile=st.form_submit_button('💾 Salvează profil',use_container_width=True)
+if save_profile:
+    new_name=profile_to_save.strip()
+    import re as _re
+    if not _re.fullmatch(r'[\w .\-]{1,45}',new_name,flags=_re.UNICODE):
+        st.error('Alege un nume de 1–45 caractere (litere, cifre, spații, punct, minus sau underscore).')
+    else:
+        try:
+            state_values={key:st.session_state['filter_'+key] for key in DEFAULT_FILTERS}
+            checked=validate_profile(base_name,state_values)
+            st.session_state['user_profiles'][new_name]={'base':base_name,'filters':checked}
+            st.success(f'Profilul „{new_name}” este salvat în sesiunea curentă. Îl poți selecta din Quick Presets; pentru păstrare, exportă JSON din sidebar.')
+        except (ValueError,KeyError) as ex:
+            st.error(f'Nu am putut salva profilul: {ex}')
+
 if pb_watch<pb_touch and timeframe=='Weekly':
     st.error('Pullback WATCH max gap must be >= first MA touch tolerance.');st.stop()
 if pb_maxweeks<=pb_upweeks and timeframe=='Weekly':
