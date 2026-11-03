@@ -1,14 +1,11 @@
 """DARVAS RS SCREENER — Streamlit app for GitHub + Streamlit Community Cloud.
-No simulated signals. Free delayed/EOD Yahoo source + optional SCTR and Barchart.
+No simulated signals. Free delayed/EOD Yahoo source + optional imported StockCharts SCTR.
 """
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import StringIO
-import json
-import math
 import re
-import time
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -18,10 +15,11 @@ import streamlit as st
 import yfinance as yf
 
 from screener_core import Rules, normalized, find_setup, annotate_percentile, passes_rs
+from pullback_core import PullbackRules, first_pullback_setup
 from hover_chart import render_results
 from sctr_paste import parse_sctr_paste
 
-st.set_page_config(page_title='DARVAS RS | Breakout Scanner',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
+st.set_page_config(page_title='DARVAS RS | Darvas & 20W Pullback',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
 
 BG='#0b1018'; PANEL='#131b26'; GREEN='#27d09a'; MUTED='#a7b9cd'
 STYLE=r"""
@@ -107,9 +105,15 @@ def download_prices(symbols:tuple[str,...],months:int)->tuple[dict[str,pd.DataFr
     return data,errors
 
 
-def only_completed(df:pd.DataFrame,completed_only:bool)->pd.DataFrame:
+def only_completed(df:pd.DataFrame,completed_only:bool,timeframe:str='Daily')->pd.DataFrame:
     if not completed_only or df.empty:return df
     ny=datetime.now(ZoneInfo('America/New_York'))
+    if timeframe=='Weekly':
+        # Weekly resample would otherwise mistake a Mon–Thu PARTIAL WEEK for a closed candle.
+        last_friday=ny.date()-timedelta(days=(ny.weekday()-4)%7)
+        if ny.weekday()==4 and (ny.hour,ny.minute)<(16,10):
+            last_friday-=timedelta(days=7)
+        return df.loc[df.index.date<=last_friday]
     # Regular session normally ends 16:00 ET; 10-minute guard. Half days may
     # need a manual check. Weekly resampling uses the same completed daily bars.
     if df.index[-1].date()==ny.date() and (ny.hour,ny.minute)<(16,10):
@@ -128,33 +132,29 @@ def normalized_exchange(value:str|None)->str|None:
 
 
 @st.cache_data(ttl=86400,show_spinner=False)
-def fetch_metadata(symbol:str,need_exchange:bool=False)->dict:
+def fetch_exchange(symbol:str)->str|None:
+    """Only called when exchange filter is selected; no market-cap queries."""
     try:
-        ticker=yf.Ticker(symbol)
-        fi=ticker.fast_info
-        cap=fi.get('market_cap')
-        cap=float(cap) if cap and pd.notna(cap) else None
-        exchange=normalized_exchange(fi.get('exchange'))
-        # If an exchange filter is active, resolve unknown exchange from company
-        # metadata, and exclude missing data rather than silently bypass it.
-        if need_exchange and exchange is None:
-            info=ticker.get_info()
+        t=yf.Ticker(symbol)
+        exchange=normalized_exchange(t.fast_info.get('exchange'))
+        if not exchange:
+            info=t.get_info()
             exchange=normalized_exchange(info.get('exchange') or info.get('fullExchangeName'))
-            if cap is None and info.get('marketCap'):cap=float(info['marketCap'])
-        return dict(cap=cap,exchange=exchange)
-    except Exception:return dict(cap=None,exchange=None)
+        return exchange
+    except Exception:
+        return None
 
 
-def bulk_meta(symbols:list[str],need_exchange:bool=False)->dict[str,dict]:
+def bulk_exchanges(symbols:list[str])->dict[str,str|None]:
     if not symbols:return {}
-    out={}
+    output={}
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures={pool.submit(fetch_metadata,s,need_exchange):s for s in symbols}
+        futures={pool.submit(fetch_exchange,s):s for s in symbols}
         for f in as_completed(futures):
             ticker=futures[f]
-            try:out[ticker]=f.result()
-            except Exception:out[ticker]={'cap':None,'exchange':None}
-    return out
+            try:output[ticker]=f.result()
+            except Exception:output[ticker]=None
+    return output
 
 
 def guess_column(df:pd.DataFrame,aliases:set[str])->str|None:
@@ -171,10 +171,7 @@ def parse_scores_csv(content:bytes)->tuple[dict[str,dict],str]:
     ticker_col=guess_column(df,{'symbol','ticker','tickersymbol','stock'})
     if ticker_col is None:return {},'No Symbol / Ticker column found'
     aliases={'sctr':{'sctr','sctrrank','stockchartstechnicalrank','sctrscore'},
-      'barchart':{'barchart','technicalopinion','barchartopinion','overallopinion','opinion','technicals','overallaveragesignal'},
-      'quality':{'quality','qualityscore','qualityrank'},
-      'growth':{'growth','growthscore','growthrank'},
-      'cap':{'marketcap','marketcapitalization','mktcap'},'sector':{'sector'},'industry':{'industry'}}
+      'sector':{'sector'},'industry':{'industry'}}
     fields={key:guess_column(df,names) for key,names in aliases.items()}
     out={}
     for _,row in df.iterrows():
@@ -183,63 +180,19 @@ def parse_scores_csv(content:bytes)->tuple[dict[str,dict],str]:
         result={}
         for key,col in fields.items():
             if col is None or pd.isna(row[col]):continue
-            if key in ('sector','industry','barchart'):
+            if key in ('sector','industry'):
                 result[key]=str(row[col]).strip();continue
             val=str(row[col]).strip().replace(',','').replace('%','').replace('$','')
             try:result[key]=float(val)
             except ValueError:pass
-        if 'cap' in result and result['cap']<1_000_000:
-            # Some CSVs export 'market cap' in millions; can't safely infer unit.
-            result.pop('cap',None)
         out[ticker]=result
     return out,f'{len(out)} symbols imported; detected columns: '+', '.join(k for k,v in fields.items() if v is not None)
-
-
-@st.cache_data(ttl=3600,show_spinner=False)
-def barchart_signals(symbols:tuple[str,...],key:str)->dict[str,str]:
-    if not key:return {}
-    results={}
-    for start in range(0,len(symbols),25):
-        batch=symbols[start:start+25]
-        try:
-            rsp=requests.get('https://ondemand.websol.barchart.com/getSignal.json',
-                params={'apikey':key,'symbols':','.join(batch)},timeout=20)
-            rsp.raise_for_status();body=rsp.json()
-            for item in body.get('results',[]):
-                symbol=str(item.get('symbol','')).upper().replace('.','-')
-                val=item.get('overallAverageSignal')
-                strength=str(item.get('overallAverageStrength','')).lower()
-                if val is not None and strength=='strong' and str(val).lower() in ('buy','sell'):
-                    val='Strong '+str(val)
-                if symbol and val is not None:results[symbol]=str(val)
-        except Exception:continue
-    return results
-
-
-def good_barchart(value,kind):
-    if kind=='Off':return True
-    if value is None:return False
-    s=str(value).lower().replace('_',' ').strip()
-    if kind=='Buy or Strong Buy':return 'buy' in s and 'sell' not in s
-    if kind=='Strong Buy only':return 'strong buy' in s
-    return True
-
-
-def apply_external_filters(row:dict,minimum_quality:float,minimum_growth:float,
-    external_on:bool,sctr_on:bool,sctr_min:float,barchart_filter:str)->bool:
-    if external_on:
-        if row.get('quality') is None or row.get('growth') is None:return False
-        if row['quality']<minimum_quality or row['growth']<minimum_growth:return False
-    if sctr_on:
-        if row.get('sctr') is None or row['sctr']<sctr_min:return False
-    if not good_barchart(row.get('barchart'),barchart_filter):return False
-    return True
 
 
 st.markdown('''<div style="display:flex;gap:15px;align-items:center;margin:0 0 5px">
 <div style="font-weight:900;letter-spacing:.11em;font-size:12px;color:#26c98d;border:1px solid #267158;border-radius:5px;padding:4px 8px">DARVAS / RS</div>
 <div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner</div>
-</div><div style="color:#aec2d4;margin-bottom:14px">Daily & Weekly consolidation breakouts · SPY / SPX relative strength · native annotated hover charts</div>''',unsafe_allow_html=True)
+</div><div style="color:#aec2d4;margin-bottom:14px">Daily/Weekly Darvas & VCP · Weekly first pullback to 20 MA · RS vs SPY/SPX · hover charts</div>''',unsafe_allow_html=True)
 
 with st.sidebar:
     st.header('Data & universe')
@@ -248,8 +201,8 @@ with st.sidebar:
     ticker_text=st.text_area('Additional / custom tickers',height=105,placeholder='NVDA, PLTR, ANET, VRT, ...')
     max_symbols=st.number_input('Max tickers to scan',min_value=10,max_value=650,value=150,step=25)
     st.divider()
-    st.subheader('Scores: StockCharts / Barchart')
-    score_upload=st.file_uploader('CSV with SCTR / Barchart / Quality / Growth',type=['csv'],help='Import exported StockCharts scan results or Barchart data; Quality/Growth must come from your own score source.')
+    st.subheader('StockCharts · SCTR')
+    score_upload=st.file_uploader('CSV with ticker + SCTR (optional sector / industry)',type=['csv'],help='Optional CSV exported from StockCharts. Alternatively paste the public SCTR table below.')
     scores={};import_message=''
     if score_upload:
         scores,import_message=parse_scores_csv(score_upload.getvalue())
@@ -263,13 +216,11 @@ with st.sidebar:
                 st.success(pasted_message)
                 for ticker, data in pasted.items():
                     scores.setdefault(ticker, {}).update(data)
-                st.caption('SCTR lipit are prioritate față de SCTR din CSV pentru tickerele comune. Nu înlocuiește Quality sau Growth.')
+                st.caption('Scorurile SCTR lipite au prioritate față de CSV (snapshot manual, fără actualizare automată).')
                 as_csv=pd.DataFrame([{'Ticker':t,'SCTR':v['sctr'],'Sector':v.get('sector',''),'Industry':v.get('industry','')} for t,v in pasted.items()])
                 st.download_button('↓ Descarcă SCTR ca CSV',as_csv.to_csv(index=False).encode('utf-8-sig'),file_name='stockcharts_sctr_import.csv',mime='text/csv')
             else:st.warning(pasted_message)
-    api_key=st.text_input('Barchart OnDemand API key (optional)',type='password',help='Licensed API access only. This is not a Barchart website password.')
-    enable_api=st.checkbox('Fetch Barchart getSignal through licensed API',value=False,disabled=not bool(api_key))
-    st.caption('SCTR: CSV sau text copiat manual din StockCharts. Fără API public SCTR și fără actualizare automată.')
+    st.caption('SCTR este un snapshot din StockCharts; nu reprezintă date live. Poți relipi tabelul când vrei să îl actualizezi.')
     st.divider()
     st.caption('TIP: Hover over a result ticker to see the actual price chart, EMA, box, volume and RS.')
 
@@ -279,15 +230,25 @@ with st.form('scan_settings'):
     with u1:timeframe=st.selectbox('Timeframe',['Weekly','Daily'])
     with u2:direction=st.selectbox('Direction',['Long','Short'])
     with u3:benchmark=st.selectbox('RS benchmark',['SPY','SPX (^GSPC)'])
-    with u4:mode=st.selectbox('Scan mode',['Both','Breakout','Near breakout'])
-    with u5:lookback=st.selectbox('Signal within last bars',[1,2,3,4,5,6],index=2)
-    a1,a2,a3,a4=st.columns([1,1,1,1])
-    with a1:minimum_market_cap=st.number_input('Market cap minimum ($B)',min_value=0.0,max_value=10000.0,value=1.0,step=0.5)
-    with a2:quality_min=st.number_input('Quality score minimum',min_value=0,max_value=100,value=60)
-    with a3:growth_min=st.number_input('Growth score minimum',min_value=0,max_value=100,value=60)
-    with a4:fundamentals_on=st.checkbox('Enforce Quality & Growth CSV',value=False,help='Requires both external scores. No invented Financial Wisdom scores.')
+    with u4:mode_label=st.selectbox('Scan mode',['Both (Breakout + Pre-Breakout)','Breakout only','Pre-Breakout only','All incl. Inside Box'])
+    with u5:lookback=st.selectbox('Breakout freshness: last N bars',[1,2,3,5,10,20],index=2,help='Completed Daily or Weekly bars; 1 = only the latest completed candle.')
+    mode={'Both (Breakout + Pre-Breakout)':'Both','Breakout only':'Breakout',
+          'Pre-Breakout only':'Near breakout','All incl. Inside Box':'All setups'}[mode_label]
     exchange_filter=st.multiselect('Exchange filter (leave blank for all US exchanges)',['NASDAQ','NYSE','AMEX','NYSE Arca'],default=[])
 
+    if timeframe=='Weekly':
+        strategy=st.selectbox('Strategy / setup to scan',
+            ['Darvas + VCP','First Pullback to 20W MA','All (Darvas/VCP + First Pullback)'],index=2,
+            help='Pullback is exclusively Weekly and uses 20-WEEK EMA by default, not 20-day MA.')
+    else:
+        strategy='Darvas + VCP'
+        st.caption('First Pullback to 20W MA is Weekly only. Daily charts scan Darvas/VCP.')
+    st.caption('Darvas = rezistența maximului intervalului selectat. VCP = rezistența ultimei contracții. Weekly pullback = primul retest 20W MA după breakout și impuls.')
+    pattern_family=st.radio('Pattern family', ['Both (Darvas + Tight VCP)','Darvas Box only','Tight Base / VCP only'],horizontal=True,
+        help='Darvas: full selected range high. VCP: recent contraction after a wider range, with a local tight pivot and optional volume dry-up.')
+    pattern_family={'Both (Darvas + Tight VCP)':'Both','Darvas Box only':'Darvas','Tight Base / VCP only':'VCP'}[pattern_family]
+    if direction=='Short' and pattern_family=='VCP':
+        st.warning('This release implements VCP for Long only. For Short use the Darvas Box family.')
     st.markdown('### 02 · Box entry filters')
     b1,b2,b3,b4=st.columns(4)
     with b1:min_bars=st.number_input('Minimum consolidation bars',min_value=3,max_value=52,value=6)
@@ -310,22 +271,70 @@ with st.form('scan_settings'):
         with e2:touch_tol=st.number_input('Touch tolerance (%)',min_value=0.1,max_value=10.0,value=2.5,step=0.5)
         with e3:near_distance=st.number_input('Near-box: max distance from boundary (%)',min_value=0.1,max_value=30.0,value=5.0)
         with e4:completed_only=st.checkbox('Completed candles only (default)',value=True)
+        e5,e6,e7=st.columns([1.5,1,1.5])
+        with e5:resistance_basis=st.selectbox('Box resistance method',
+             ['Highest wick (range box)','Highest close (early-warning, non-classic)'],index=0,
+             help='Wick = maximum High of the N bars. Close = highest closing price and ignores wicks; not a classical Darvas breakout.')
+        with e6:confirmed_pivot=st.checkbox('Require 3 lower highs after pivot',value=False,
+             help='Requires a confirmed swing high BEFORE breakout, with 3 completed following lower highs. Works with wick-based box only.')
+        with e7:max_inside_distance=st.number_input('Inside Box: maximum gap below resistance (%)',min_value=5.0,max_value=100.0,value=20.0,step=2.5)
 
-    st.markdown('### 03 · Relative Strength + external scores')
+    with st.expander('Tight Base / VCP detection (ABBV-style)',expanded=True):
+        st.caption('Late tight range is measured over N completed bars before the signal, and compared with the preceding N bars. Pivot = highest HIGH in late range. Volume dry-up is optional. This is a mechanical VCP proxy, not a discretionary Minervini certification.')
+        v1,v2,v3,v4=st.columns(4)
+        with v1:vcp_tight=st.number_input('VCP max final box width (%)',min_value=1.0,max_value=40.0,value=12.0,step=1.0)
+        with v2:vcp_range=st.number_input('VCP latest/earlier range max ratio',min_value=0.1,max_value=1.0,value=0.8,step=0.05,
+            help='0.80 means the final base range must be at least 20% tighter than the older range.')
+        with v3:vcp_atr=st.number_input('VCP latest/earlier avg TR max ratio',min_value=0.1,max_value=1.5,value=0.95,step=0.05,
+            help='Average relative true range of individual bars, current base vs older range.')
+        with v4:vcp_clear=st.number_input('VCP breakout close above pivot MIN (%)',min_value=0.0,max_value=10.0,value=0.15,step=0.05,
+            help='Independent of the 4% breakout clearance required for the classic Darvas setup.')
+        v5,v6,v7=st.columns(3)
+        with v5:vcp_dry=st.checkbox('Require volume dry-up during VCP',value=False)
+        with v6:vcp_vol=st.number_input('Max latest/earlier volume ratio',min_value=0.1,max_value=2.0,value=0.9,step=0.05)
+        with v7:vcp_stop=st.number_input('VCP stop buffer below last base low (%)',min_value=0.0,max_value=5.0,value=0.3,step=0.1)
+    if timeframe=='Weekly':
+        with st.expander('First pullback to 20-WEEK MA (MA-style)', expanded='Pullback' in strategy):
+            st.caption('20-WEEK EMA (sau SMA) · breakout dintr-o bază anterioară · minimum câteva săptămâni de avans · fără atingeri MA înainte · prima apropiere/atingere/confirmare. Semnalele WATCH nu sunt intrări executate.')
+            pb1,pb2,pb3,pb4=st.columns(4)
+            with pb1:pb_ma=st.selectbox('20W moving average',['EMA','SMA'])
+            with pb2:pb_stage=st.selectbox('Pullback stage',['All','Watch','First touch','Bounce'])
+            with pb3:pb_upweeks=st.number_input('Weeks of uptrend after breakout MIN',min_value=2,max_value=10,value=3)
+            with pb4:pb_maxweeks=st.number_input('Max weeks since breakout',min_value=4,max_value=36,value=16)
+            pb5,pb6,pb7,pb8=st.columns(4)
+            with pb5:pb_advance=st.number_input('Impulse gain above breakout MIN (%)',min_value=2.0,max_value=100.0,value=8.0,step=1.0)
+            with pb6:pb_touch=st.number_input('First MA touch tolerance (%)',min_value=0.0,max_value=10.0,value=2.0,step=0.5,
+                 help='Weekly Low can be up to this percentage ABOVE 20W MA and count as a first touch.')
+            with pb7:pb_watch=st.number_input('Watch: low above MA max gap (%)',min_value=2.0,max_value=20.0,value=5.0,step=0.5)
+            with pb8:pb_undercut=st.number_input('Max low undercut below MA (%)',min_value=0.0,max_value=12.0,value=2.5,step=0.5)
+            pb9,pb10,pb11,pb12=st.columns(4)
+            with pb9:pb_breakperiod=st.number_input('Pre-breakout highest-high window (weeks)',min_value=4,max_value=20,value=8)
+            with pb10:pb_breakclear=st.number_input('Prior breakout close above high (%)',min_value=0.0,max_value=10.0,value=0.5,step=0.25)
+            with pb11:pb_stop=st.number_input('Stop below touch-week low (%)',min_value=0.0,max_value=10.0,value=0.5,step=0.25)
+            with pb12:pb_risk=st.number_input('Pullback maximum entry risk (%)',min_value=1.0,max_value=40.0,value=16.0,step=1.0)
+    else:
+        pb_ma='EMA';pb_stage='All';pb_upweeks=3;pb_maxweeks=16;pb_advance=8.0;pb_touch=2.0
+        pb_watch=5.0;pb_undercut=2.5;pb_breakperiod=8;pb_breakclear=.5;pb_stop=.5;pb_risk=16.0
+    st.markdown('### 03 · Relative Strength + SCTR')
     f1,f2,f3,f4=st.columns(4)
     with f1:rs_mode=st.selectbox('RS vs benchmark filter',['3M outperform','Off','52w RS high','3M outperform + 52w high'])
     with f2:rs_min=st.number_input('Min RS 3-month outperformance (%)',min_value=-100.0,max_value=1000.0,value=0.0,step=1.0)
     with f3:rs_pctl=st.number_input('Min RS rank percentile in scanned universe',min_value=0,max_value=100,value=0,step=5,help='Calculated among ALL downloaded universe symbols, not a proprietary RS rank.')
     with f4:sctr_min=st.number_input('Min SCTR (StockCharts)',min_value=0,max_value=100,value=70)
-    g1,g2,g3=st.columns([1,1,2])
+    g1,g2=st.columns([1,3])
     with g1:sctr_on=st.checkbox('Enforce imported SCTR',value=False)
-    with g2:barchart_filter=st.selectbox('Barchart Opinion',['Off','Buy or Strong Buy','Strong Buy only'])
-    with g3:st.caption('Quality/Growth/SCTR/Barchart are intentionally blank unless imported or fetched from licensed source. No score is fabricated.')
-    submitted=st.form_submit_button('▶ RUN DARVAS SCAN',type='primary',use_container_width=True)
+    with g2:st.caption('SCTR este oficial doar când este importat din StockCharts; RS este calculat local din OHLCV. Fără Market Cap și fără alte scoruri externe.')
+    submitted=st.form_submit_button('▶ RUN SCREENER',type='primary',use_container_width=True)
 
+if pb_watch<pb_touch and timeframe=='Weekly':
+    st.error('Pullback WATCH max gap must be >= first MA touch tolerance.');st.stop()
+if pb_maxweeks<=pb_upweeks and timeframe=='Weekly':
+    st.error('Pullback breakout max age must be greater than required uptrend weeks.');st.stop()
 if min_bars>max_bars:
     st.error('Minimum consolidation bars cannot exceed maximum consolidation bars.')
     st.stop()
+if confirmed_pivot and resistance_basis.startswith('Highest close'):
+    st.error('Confirmed pivot (3 lower highs) requires Highest wick resistance method.');st.stop()
 if breakout_min>breakout_max:
     st.error('Breakout MIN cannot exceed MAX.')
     st.stop()
@@ -333,15 +342,15 @@ if breakout_min>breakout_max:
 base=get_universe(universe)
 extra=parse_tickers(ticker_text)
 tickers=list(dict.fromkeys(([t for t, v in scores.items() if 'sctr' in v] if universe=='Imported SCTR list' else (base if universe!='Custom list' else []))+extra))[:int(max_symbols)]
-st.caption(f'Universe selected: **{len(tickers)} symbols** / {(sum('sctr' in v for v in scores.values()) if universe=='Imported SCTR list' else len(base))+len(extra)} requested before deduplication and cap · RS = (stock / benchmark) momentum · 3M = 13 weekly bars / 63 daily bars.')
+st.caption(f'Universe selected: **{len(tickers)} symbols** / {(sum('sctr' in v for v in scores.values()) if universe=='Imported SCTR list' else len(base))+len(extra)} requested before deduplication and scan limit · RS = (stock / benchmark) momentum · 3M = 13 weekly bars / 63 daily bars.')
 if submitted:
     if not tickers:
         st.error('Add tickers in the sidebar for a custom scan.');st.stop()
-    with st.spinner(f'Downloading daily price histories for {len(tickers)} stocks, then evaluating {timeframe.lower()} Darvas setups...'):
+    with st.spinner(f'Downloading daily price histories for {len(tickers)} stocks, then evaluating {timeframe.lower()} breakout/pullback setups...'):
         benchmark_ticker='SPY' if benchmark=='SPY' else '^GSPC'
         all_tickers=tuple(dict.fromkeys([*tickers,benchmark_ticker]))
         raw,errors=download_prices(all_tickers,38)
-        bench=only_completed(raw.get(benchmark_ticker,pd.DataFrame()),completed_only)
+        bench=only_completed(raw.get(benchmark_ticker,pd.DataFrame()),completed_only,timeframe)
         if len(bench)<80:
             st.error('Benchmark OHLCV could not be retrieved. Scan cancelled — no fabricated results.');st.stop()
         rules=Rules(direction=direction,minimum_bars=int(min_bars),maximum_bars=int(max_bars),
@@ -350,87 +359,103 @@ if submitted:
           min_close_strength=close_strength,min_volume_increase=min_volume,
           entry_buffer_pct=entry_buffer,confirm_ema=ema_on,confirm_macd=macd_on,
           min_touches=touches,touch_tolerance_pct=touch_tol,recent_bars=int(lookback),
-          near_distance_pct=near_distance,mode=mode)
+          near_distance_pct=near_distance,max_inside_distance_pct=max_inside_distance,mode=mode,
+          resistance_basis='Highest close' if resistance_basis.startswith('Highest close') else 'Wick high',
+          require_confirmed_pivot=confirmed_pivot, pattern_family=pattern_family,
+          vcp_max_tight_pct=vcp_tight, vcp_max_range_ratio=vcp_range,
+          vcp_max_atr_ratio=vcp_atr, vcp_require_dry_volume=vcp_dry,
+          vcp_max_volume_ratio=vcp_vol, vcp_breakout_min_pct=vcp_clear,
+          vcp_stop_buffer_pct=vcp_stop)
+        pullback_rules=PullbackRules(ma_kind=pb_ma,breakout_lookback=int(pb_breakperiod),
+            breakout_clearance_pct=pb_breakclear,min_advance_weeks=int(pb_upweeks),
+            max_weeks_since_breakout=int(pb_maxweeks),min_advance_pct=pb_advance,
+            touch_tolerance_pct=pb_touch,max_undercut_pct=pb_undercut,
+            watch_distance_pct=pb_watch,stop_buffer_pct=pb_stop,max_risk_pct=pb_risk,
+            max_signal_age=int(lookback),stage_mode=pb_stage)
         candidates=[];rs_all={};available=0
         for ticker in tickers:
-            d=only_completed(raw.get(ticker,pd.DataFrame()),completed_only)
+            d=only_completed(raw.get(ticker,pd.DataFrame()),completed_only,timeframe)
             if d.empty:continue
             available+=1
-            setup,rs=find_setup(d,bench,timeframe,rules)
+            if strategy!='First Pullback to 20W MA':
+                setup,rs=find_setup(d,bench,timeframe,rules)
+                if setup:candidates.append({'ticker':ticker,**setup})
+            else:
+                rs={}
+            if timeframe=='Weekly' and strategy!='Darvas + VCP':
+                pullback, pb_rs=first_pullback_setup(d,bench,'Weekly',pullback_rules)
+                if pullback:candidates.append({'ticker':ticker,**pullback})
+                rs=pb_rs
             rs_all[ticker]=rs.get('rs_3m')
-            if setup:candidates.append({'ticker':ticker,**setup})
         percentiles=annotate_percentile(rs_all)
         selected=[];rejected_rs=0;rejected_scores=0
-        api_signals=barchart_signals(tuple(s['ticker'] for s in candidates),api_key) if enable_api else {}
-        # Apply external/rank checks before potentially costly market-cap verification.
         for r in candidates:
             t=r['ticker'];r['rs_percentile']=percentiles.get(t)
             values=scores.get(t,{})
-            for field in ('quality','growth','sctr','barchart','sector','industry'):
+            for field in ('sctr','sector','industry'):
                 r[field]=values.get(field)
-            if r.get('barchart') is None and t in api_signals:r['barchart']=api_signals[t]
             if not passes_rs(r,rs_mode,rs_min,r['rs_percentile'],rs_pctl):
                 rejected_rs+=1;continue
-            if not apply_external_filters(r,quality_min,growth_min,fundamentals_on,sctr_on,sctr_min,barchart_filter):
+            if sctr_on and (r.get('sctr') is None or r['sctr']<sctr_min):
                 rejected_scores+=1;continue
             selected.append(r)
-        cap_unavailable=0;cap_under=0;exchange_rejected=0
-        if selected and (minimum_market_cap>0 or exchange_filter):
-            needed=[r['ticker'] for r in selected if
-                    (minimum_market_cap>0 and scores.get(r['ticker'],{}).get('cap') is None)
-                    or bool(exchange_filter)]
-            meta=bulk_meta(needed,need_exchange=bool(exchange_filter))
-            qualified=[]
+        # No market-cap requirements, no automatic cap metadata lookups.
+        # Only verify exchange when the user explicitly selected an exchange filter.
+        exchange_rejected=0
+        if exchange_filter and selected:
+            exchanges=bulk_exchanges([r['ticker'] for r in selected])
+            accepted=[]
             for r in selected:
-                cap=scores.get(r['ticker'],{}).get('cap')
-                if cap is None:cap=meta.get(r['ticker'],{}).get('cap')
-                r['cap_billion']=round(cap/1e9,2) if cap else None
-                r['exchange']=normalized_exchange(meta.get(r['ticker'],{}).get('exchange'))
-                if minimum_market_cap>0:
-                    if cap is None:cap_unavailable+=1;continue
-                    if cap < minimum_market_cap*1e9:cap_under+=1;continue
-                if exchange_filter and r['exchange'] not in exchange_filter:
-                    exchange_rejected+=1;continue
-                qualified.append(r)
-            selected=qualified
+                r['exchange']=exchanges.get(r['ticker'])
+                if r['exchange'] not in exchange_filter:
+                    exchange_rejected+=1
+                    continue
+                accepted.append(r)
+            selected=accepted
         else:
             for r in selected:
-                cap=scores.get(r['ticker'],{}).get('cap')
-                r['cap_billion']=round(cap/1e9,2) if cap else None
                 r['exchange']=None
-        selected.sort(key=lambda r:(r['status']=='BREAKOUT',r.get('rs_percentile') or -100,r.get('rs_3m') or -100),reverse=True)
+        priority={'BOUNCE CONFIRMED':5,'FIRST MA TOUCH':4,'BREAKOUT':3,'PRE-BREAKOUT':2,'PULLBACK WATCH':1,'IN BOX':0}
+        selected.sort(key=lambda r:(priority.get(r['status'],0),r.get('rs_percentile') or -100,r.get('rs_3m') or -100),reverse=True)
         st.session_state['results']={'data':selected,'timeframe':timeframe,'benchmark':benchmark,
            'asof':datetime.now(ZoneInfo('Europe/Bucharest')).strftime('%Y-%m-%d %H:%M Europe/Bucharest'),
            'requested':len(tickers),'available':available,'technical':len(candidates),
            'rejected_rs':rejected_rs,'rejected_scores':rejected_scores,
-           'missing':len(tickers)-available,'cap_unavailable':cap_unavailable,'cap_under':cap_under,'exchange_rejected':exchange_rejected,
-           'mode':mode,'score_info':import_message,'mincap':minimum_market_cap}
+           'missing':len(tickers)-available,'exchange_rejected':exchange_rejected,
+           'mode':mode,'strategy':strategy,'score_info':import_message,
+           'technical_candidates':sorted(candidates,key=lambda r:r.get('rs_3m') or -100,reverse=True)[:120],
+           'resistance_basis':rules.resistance_basis,'confirmed_pivot':confirmed_pivot,'lookback':lookback}
 
 if 'results' in st.session_state:
     res=st.session_state['results']; rows=res['data']
     st.divider(); st.markdown('### 04 · Scan results')
-    k1,k2,k3,k4,k5=st.columns(5)
-    k1.metric('Matches',len(rows));k2.metric('Breakout',sum(r['status']=='BREAKOUT' for r in rows))
-    k3.metric('Near box',sum(r['status']=='NEAR BOX' for r in rows))
-    k4.metric('Technical candidates',res['technical']);k5.metric('OHLCV available',f"{res['available']}/{res['requested']}")
+    k1,k2,k3,k4,k5,k6=st.columns(6)
+    k1.metric('Matches',len(rows));k2.metric('Darvas/VCP Breakout',sum(r['status']=='BREAKOUT' for r in rows))
+    k3.metric('Pre-Breakout',sum(r['status']=='PRE-BREAKOUT' for r in rows))
+    k4.metric('First 20W MA Pullback',sum(r['pattern']=='First pullback 20W MA' for r in rows))
+    k5.metric('Technical candidates',res['technical']);k6.metric('OHLCV available',f"{res['available']}/{res['requested']}")
     st.caption('Last scan: '+res['asof']+' · Data: Yahoo Finance adjusted historical prices (EOD/delayed) · Hover on ticker for price+volume+RS chart. No alerts/orders placed.')
     if res['missing']:st.warning(f"{res['missing']} symbols had insufficient/unavailable price history and were NOT scanned.")
-    if res['cap_unavailable']:
-        st.warning(f"Market cap unavailable for {res['cap_unavailable']} candidates; excluded because the ${res['mincap']}B minimum is active. Set cap minimum to 0 to keep them without verification.")
     if not rows:
-        st.info('No signals match all active filters. Try **Both**, reduce 4% breakout clearance, set RS to Off, broaden the universe, or disable unavailable external-score filters. These are authentic zero results, not sample tickers.')
+        st.info('No signals match all active filters. Try a broader stage selection, increase the pullback watch tolerance, set RS to Off, widen the VCP range tolerance, or disable the SCTR requirement for a diagnostic scan. These are authentic zero results, not sample tickers.')
     if rows:
         st.iframe(render_results(rows,res['timeframe'],res['benchmark']),height=750,width='stretch')
         flat=[]
         for r in rows:
             flat.append({k:v for k,v in r.items() if k not in ('chart','rs_line','rs_dates')})
         st.download_button('↓ Download matched tickers & scan metrics (CSV)',pd.DataFrame(flat).to_csv(index=False).encode('utf-8-sig'),
-          file_name=f"darvas_rs_{res['timeframe'].lower()}_{datetime.now().strftime('%Y%m%d')}.csv",mime='text/csv')
+          file_name=f"darvas_rs_pullback_{res['timeframe'].lower()}_{datetime.now().strftime('%Y%m%d')}.csv",mime='text/csv')
+    if res.get('technical_candidates'):
+        with st.expander(f"Technical candidate explorer ({res['technical']} setups before RS/SCTR/exchange) · top 120",expanded=False):
+            st.caption('Research list BEFORE RS, SCTR or exchange filters. Not actionable signals until verified. Hover/click ticker for the chart.')
+            st.iframe(render_results(res['technical_candidates'],res['timeframe'],res['benchmark']),height=560,width='stretch')
+            subset=[{k:v for k,v in r.items() if k not in ('chart','rs_line','rs_dates')} for r in res['technical_candidates']]
+            st.download_button('↓ Export technical candidates CSV',pd.DataFrame(subset).to_csv(index=False).encode('utf-8-sig'),file_name='darvas_candidates.csv',mime='text/csv')
     with st.expander('Scan diagnostics & methodology'):
-        st.write(f"Technical setups before RS/scores/cap: **{res['technical']}**. RS rejected **{res['rejected_rs']}**; external scores rejected **{res['rejected_scores']}**; cap below minimum **{res['cap_under']}**; cap unavailable **{res['cap_unavailable']}**; exchange rejected/unknown **{res['exchange_rejected']}**.")
-        st.markdown('**Box range** = (highest high − lowest low) / lowest low across preceding N bars. **Breakout** = completed candle close at least X% above resistance; its candle is excluded from the box. **Close strength** = (close − low) / (high − low) on breakout candle. **Volume** = change vs immediately prior bar. **Initial stop** = box bottom + 33% × box height (long); **risk** uses entry beyond breakout close. **RS 3M** = return of (stock close / benchmark close) ratio over 13 weekly or 63 daily bars. **RS rank** = percentile within downloaded universe (not proprietary SCTR).')
-        st.caption('Historical 412% return reported in the video is NOT reproduced by this app; this is a current screener, not a point-in-time survivorship-free portfolio backtest. Free public sources can be delayed, incomplete, adjusted or rate-limited. Market-cap filters use current caps, not historical caps.')
+        st.write(f"Technical setups before RS/SCTR/exchange: **{res['technical']}**. RS rejected **{res['rejected_rs']}**; SCTR rejected **{res['rejected_scores']}**; exchange rejected/unknown **{res['exchange_rejected']}**.")
+        st.markdown('**First Pullback 20W MA**: completed WEEKLY candles only; breakout over a previous N-week high, at least several weekly candles of advance, min impulse, no interim pullback to the 20-week MA tolerance zone, a rising MA, and the first near/touch/bounce. WATCH is not a trigger; FIRST TOUCH is a support-test candidate; BOUNCE requires a weekly close above the touch-week high. Entry/stop are reference levels, not filled orders.\n\n**VCP** = a 2-stage contraction proxy: final N-bar range smaller than preceding N-bar range, intrabar true range contracting, optional volume dry-up. Pivot is the high of the FINAL tight range, not the absolute high of the whole base. VCP breakout requires its own smaller confirmation percentage; stop uses a buffer under final contraction low. **Darvas** remains a separate rule family.\n\n**Box range** = (upper − lower) / lower across preceding N bars (wick high/low by default). **Breakout** = completed candle close at least X% above resistance; its candle is excluded from the box. **Close strength** = (close − low) / (high − low) on breakout candle. **Volume** = change vs immediately prior bar. **Initial stop** = box bottom + 33% × box height (long); **risk** uses entry beyond breakout close. **RS 3M** = return of (stock close / benchmark close) ratio over 13 weekly or 63 daily bars. **RS rank** = percentile within downloaded universe (not proprietary SCTR).')
+        st.caption('Prior pivot shown in yellow is an earlier *confirmed swing-high reference*, not the box ceiling; it can already have been breached. Highest close resistance is an experimental early-warning alternative, NOT a classic Darvas breakout. Weekly scans omit an incomplete current week. Historical 412% return reported in the video is NOT reproduced by this app; this is a current screener, not a point-in-time survivorship-free portfolio backtest. Free public sources can be delayed, incomplete, adjusted or rate-limited. No market-cap filter is applied.')
 else:
     st.info('Choose your universe and filters, then click **RUN DARVAS SCAN**. No synthetic or prefilled scan results are shown.')
 
-st.markdown('''<div style="border-top:1px solid #273b4b;margin-top:18px;padding-top:12px;color:#8398ad;font-size:12px">DARVAS RS • Technical research dashboard • Not investment advice • Does not place orders • SCTR/Barchart/Fundamental scores require authorized external data</div>''',unsafe_allow_html=True)
+st.markdown('''<div style="border-top:1px solid #273b4b;margin-top:18px;padding-top:12px;color:#8398ad;font-size:12px">DARVAS RS • Technical research dashboard • Not investment advice • Does not place orders • SCTR requires imported StockCharts snapshot</div>''',unsafe_allow_html=True)
