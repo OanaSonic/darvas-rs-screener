@@ -78,24 +78,6 @@ RECOMMENDED_PRESETS = {
 }
 
 
-def select_universe_tickers(universe: str, base_tickers: list[str],
-                            extra_tickers: list[str], scores: dict,
-                            max_symbols: int, scan_all_imported: bool):
-    """Return imported, requested, selected, cap_active.
-
-    SCTR >= threshold is intentionally NOT applied here: it is a distinct
-    signal filter. An imported 493-stock list must NOT silently shrink to
-    a stale 95-stock cap or to only the stocks above an SCTR threshold.
-    """
-    imported=[t for t,v in scores.items() if isinstance(v,dict) and 'sctr' in v]
-    core=(imported if universe=='Imported SCTR list'
-          else [] if universe=='Custom list' else base_tickers)
-    requested=list(dict.fromkeys(core+extra_tickers))
-    cap_active=universe!='Imported SCTR list' or not scan_all_imported
-    selected=requested[:max(0,int(max_symbols))] if cap_active else requested
-    return imported,requested,selected,cap_active
-
-
 def recommended_profile(name: str, imported_sctr: bool = False) -> dict:
     if name not in RECOMMENDED_PRESETS:
         raise ValueError('Preset necunoscut')

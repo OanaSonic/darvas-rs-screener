@@ -22,10 +22,9 @@ from pullback_core import PullbackRules, first_pullback_setup
 from hover_chart import render_results
 from sctr_paste import parse_sctr_paste
 from preset_profiles import (RECOMMENDED_PRESETS, DEFAULT_FILTERS, FIELD_HELP,
-    recommended_profile, validate_profile, export_user_profiles, import_user_profiles,
-    select_universe_tickers)
+    recommended_profile, validate_profile, export_user_profiles, import_user_profiles)
 
-st.set_page_config(page_title='DARVAS RS v8 | Full SCTR Universe + Clear Controls',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
+st.set_page_config(page_title='DARVAS RS | Recommended Presets & Weekly Pullback',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
 
 BG='#0b1018'; PANEL='#131b26'; GREEN='#27d09a'; MUTED='#a7b9cd'
 STYLE=r"""
@@ -38,48 +37,7 @@ html,body,[data-testid="stApp"],[data-testid="stAppViewContainer"],[data-testid=
 [data-testid="stMetricLabel"]{color:#acbfd2!important}
 [data-testid="stMetricValue"]{color:#ecf4fc!important;font-weight:750}
 [data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea,[data-testid="stNumberInput"] input,[data-testid="stSelectbox"] [data-baseweb="select"],[data-testid="stMultiSelect"] [data-baseweb="select"]{background:#17283b!important;color:#e9f4fd!important;border-color:#3e5870!important}
-/* White-on-white fix: force both the SELECT SURFACE and its text to the dark palette.
-   Do not force light text onto a native light background. Streamlit uses BaseWeb. */
-[data-testid="stSelectbox"] [data-baseweb="select"]>div,
-[data-testid="stMultiSelect"] [data-baseweb="select"]>div,
-[data-testid="stSelectbox"] [role="combobox"],
-[data-testid="stMultiSelect"] [role="combobox"],
-[data-testid="stSelectbox"] div[aria-expanded],
-[data-testid="stMultiSelect"] div[aria-expanded]
-{background:#17283b!important;color:#edf7ff!important;border-color:#446078!important;box-shadow:none!important}
-[data-testid="stSelectbox"] [data-baseweb="select"] span,
-[data-testid="stSelectbox"] [data-baseweb="select"] input,
-[data-testid="stSelectbox"] [data-baseweb="select"] [class*="ValueContainer"],
-[data-testid="stMultiSelect"] [data-baseweb="select"] span,
-[data-testid="stMultiSelect"] [data-baseweb="select"] input,
-[data-testid="stTextInput"] input,
-[data-testid="stTextArea"] textarea,
-[data-testid="stNumberInput"] input,
-[data-testid="stWidgetLabel"] *,
-[data-testid="stSelectbox"] label *,[data-testid="stMultiSelect"] label *
-{color:#edf7ff!important;-webkit-text-fill-color:#edf7ff!important;opacity:1!important}
-[data-baseweb="popover"],[data-baseweb="menu"],[role="listbox"],[role="option"]
-{background:#192a3e!important;color:#edf7ff!important}
-[data-baseweb="popover"] *,[role="listbox"] *,[role="option"] *
-{color:#edf7ff!important;-webkit-text-fill-color:#edf7ff!important}
-/* Streamlit secondary buttons default to a WHITE background in some theme versions.
-   We set the button fill AND foreground together, incl. on mouseover. */
-[data-testid="stButton"] button:not([kind="primary"]),
-[data-testid="stFormSubmitButton"] button:not([kind="primary"]),
-.stButton>button:not([kind="primary"])
-{background:#1c3046!important;color:#eef7ff!important;border:1px solid #44637d!important;opacity:1!important}
-[data-testid="stButton"] button:not([kind="primary"]):hover,
-[data-testid="stFormSubmitButton"] button:not([kind="primary"]):hover
-{background:#2b4560!important;color:#ffffff!important;border-color:#6e98b6!important}
-[data-testid="stButton"] button *,
-[data-testid="stFormSubmitButton"] button *
-{color:inherit!important;-webkit-text-fill-color:currentColor!important}
-[data-testid="stNumberInput"] button
-{background:#25394e!important;color:#f1f8ff!important;border-color:#45617a!important}
-[data-testid="stFileUploaderDropzone"]
-{background:#17283b!important;color:#f0f6fc!important;border-color:#45617a!important}
-[data-testid="stFileUploaderDropzone"] *
-{color:#eff6fd!important;-webkit-text-fill-color:#eff6fd!important}
+[data-testid="stSelectbox"] [data-baseweb="select"] *,[data-testid="stMultiSelect"] [data-baseweb="select"] *,[data-testid="stTextInput"] input,[data-testid="stTextArea"] textarea,[data-testid="stNumberInput"] input,[data-testid="stNumberInput"] input *,[role="listbox"] *,[role="option"] *,[data-baseweb="popover"] *,[data-testid="stWidgetLabel"] *,[data-testid="stSelectbox"] label *,[data-testid="stMultiSelect"] label *{color:#e8f2fc!important;-webkit-text-fill-color:#e8f2fc!important;opacity:1!important}
 [role="listbox"],[data-baseweb="popover"],[data-baseweb="menu"],[role="option"]{background:#172637!important;color:#eaf4fe!important}
 [data-baseweb="tag"]{background:#243c52!important;color:#edf5fd!important}
 [data-testid="stExpander"]{border:1px solid #2b4053;border-radius:11px;background:#111c2a}
@@ -251,17 +209,7 @@ with st.sidebar:
     st.caption('Public Yahoo Finance OHLCV (adjusted), cached 15 min. NOT guaranteed real-time.')
     universe=st.selectbox('Stock universe',['Starter (growth leaders)','S&P 500','Nasdaq-100','Imported SCTR list','Custom list'],key='universe_choice',on_change=_universe_changed,help='Universul din care selectăm acțiunile. Imported SCTR list folosește tickerele din raportul StockCharts lipit.')
     ticker_text=st.text_area('Additional / custom tickers',height=105,placeholder='NVDA, PLTR, ANET, VRT, ...')
-    if universe == 'Imported SCTR list':
-        scan_all_imported=st.checkbox(
-            'Scanează TOATE acțiunile din lista SCTR importată',
-            value=True,key='scan_all_imported_v8',
-            help='Bifat: nu se aplică limita Max tickers. Dacă sunt importate 493, toate cele 493 sunt trimise la analiza de preț. Pragul SCTR ≥70 se verifică separat.')
-    else:
-        scan_all_imported=False
-    max_symbols=st.number_input('Max tickers to scan (numai când nu scanezi toată lista SCTR)',
-        min_value=10,max_value=2500,value=500,step=25,key='scan_limit_v8',
-        disabled=(universe=='Imported SCTR list' and scan_all_imported),
-        help='Limitează universul doar când opțiunea de scanare completă SCTR este oprită; în rest se aplică universurilor implicite/custom.')
+    max_symbols=st.number_input('Max tickers to scan',min_value=10,max_value=650,value=500,step=25)
     st.divider()
     st.subheader('StockCharts · SCTR')
     score_upload=st.file_uploader('CSV with ticker + SCTR (optional sector / industry)',type=['csv'],help='Optional CSV exported from StockCharts. Alternatively paste the public SCTR table below.')
@@ -330,12 +278,6 @@ def _apply_profile() -> None:
     st.session_state.pop('results',None)  # Never display results for a different profile.
 
 st.session_state['_universe_for_preset']=universe
-# On first load of this code revision, reapply the selected preset instead of
-# inheriting stale quick-filter widget values (e.g. RS Off / freshness 5).
-PRESET_UI_REVISION='v8.0'
-if st.session_state.get('_preset_ui_revision') != PRESET_UI_REVISION:
-    st.session_state.pop('_active_scan_preset',None)
-    st.session_state['_preset_ui_revision']=PRESET_UI_REVISION
 st.session_state.setdefault('preset_choice','Darvas Breakout')
 all_profiles=list(RECOMMENDED_PRESETS)+['★ '+name for name in st.session_state['user_profiles']]
 if st.session_state['preset_choice'] not in all_profiles:
@@ -371,8 +313,7 @@ with st.form('scan_settings'):
     q5,q6=st.columns([1.9,1.1])
     with q5:rs_mode=st.selectbox('Relative Strength filter', ['3M outperform', 'Off', '52w RS high', '3M outperform + 52w high'], help=FIELD_HELP['rs_mode'], key='filter_rs_mode')
     with q6:sctr_on=st.checkbox('Require imported SCTR', help=FIELD_HELP['sctr_on'], key='filter_sctr_on')
-    st.caption('Preset activ: **'+base_name+'** · Filtre avansate configurate automat; '
-               'folosește „Reaplică presetul” pentru a reveni la valorile recomandate.')
+    st.caption('All other criteria are configured for the selected strategy. Expand only if you need to customize them.')
 
     with st.expander('⚙ Advanced Filters — optional',expanded=False):
         st.markdown('#### Universe, pattern & signal filters')
@@ -490,27 +431,14 @@ if breakout_min>breakout_max:
 
 base=get_universe(universe)
 extra=parse_tickers(ticker_text)
-imported_sctr_tickers,requested_tickers,tickers,cap_active=select_universe_tickers(
-    universe,base,extra,scores,int(max_symbols),scan_all_imported)
-sctr_eligible=sum(1 for t in tickers if scores.get(t,{}).get('sctr',-1)>=sctr_min)
-if universe=='Imported SCTR list':
-    st.caption(f'**StockCharts importate: {len(imported_sctr_tickers)}** · **De scanat: {len(tickers)}**'
-               + (f' · **SCTR ≥{sctr_min}: {sctr_eligible}** (filtru final activ)' if sctr_on
-                  else ' · Filtrul SCTR minim este dezactivat')
-               + (' · **Listă integrală, fără limită de tickere**' if scan_all_imported
-                  else f' · Limită aplicată: {int(max_symbols)} tickere')
-               + ' · Dacă SCTR elimină multe simboluri, ele au fost totuși importate.')
-else:
-    st.caption(f'**Univers inițial: {len(requested_tickers)}** · **De scanat: {len(tickers)}**'
-               + (f' · Limită: {int(max_symbols)}' if cap_active else ''))
-st.caption('RS = raport (stock / benchmark) · 3M = 13 lumânări Weekly / 63 Daily. '
-           'Countul SCTR este distinct de universul trecut la analiza OHLCV.')
+tickers=list(dict.fromkeys(([t for t, v in scores.items() if 'sctr' in v] if universe=='Imported SCTR list' else (base if universe!='Custom list' else []))+extra))[:int(max_symbols)]
+st.caption(f'Universe selected: **{len(tickers)} symbols** / {(sum('sctr' in v for v in scores.values()) if universe=='Imported SCTR list' else len(base))+len(extra)} requested before deduplication and scan limit · RS = (stock / benchmark) momentum · 3M = 13 weekly bars / 63 daily bars.')
 if submitted:
     required_engine_version='v6.1'
     installed_core=getattr(screener_engine,'ENGINE_API_VERSION','older/unknown')
     installed_pullback=getattr(pullback_engine,'ENGINE_API_VERSION','older/unknown')
     if installed_core!=required_engine_version or installed_pullback!=required_engine_version:
-        st.error('Version mismatch between app.py and screening modules. Upload ALL files from the latest ZIP together (not only app.py): screener_core.py and pullback_core.py must also be v6.1.')
+        st.error('Version mismatch between app.py and screening modules. Upload ALL v6 files from the ZIP (not only app.py): screener_core.py and pullback_core.py must also be v6.1.')
         st.code(f'app.py requires {required_engine_version}; screener_core.py={installed_core}; pullback_core.py={installed_pullback}')
         st.stop()
     if not tickers:
