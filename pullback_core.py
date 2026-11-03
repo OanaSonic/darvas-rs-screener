@@ -4,6 +4,9 @@ All calculations use completed weekly bars, with no data retrieval or forward lo
 This is a scanner heuristic, not a model trained to label discretionary setups.
 """
 from __future__ import annotations
+
+ENGINE_API_VERSION = 'v6.1'
+
 from dataclasses import dataclass
 from typing import Optional
 import numpy as np

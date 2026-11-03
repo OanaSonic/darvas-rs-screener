@@ -14,12 +14,14 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+import screener_core as screener_engine
+import pullback_core as pullback_engine
 from screener_core import Rules, normalized, find_setup, annotate_percentile, passes_rs
 from pullback_core import PullbackRules, first_pullback_setup
 from hover_chart import render_results
 from sctr_paste import parse_sctr_paste
 
-st.set_page_config(page_title='DARVAS RS | Darvas & 20W Pullback',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
+st.set_page_config(page_title='DARVAS RS | Quick Presets & Weekly Pullback',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
 
 BG='#0b1018'; PANEL='#131b26'; GREEN='#27d09a'; MUTED='#a7b9cd'
 STYLE=r"""
@@ -192,14 +194,14 @@ def parse_scores_csv(content:bytes)->tuple[dict[str,dict],str]:
 st.markdown('''<div style="display:flex;gap:15px;align-items:center;margin:0 0 5px">
 <div style="font-weight:900;letter-spacing:.11em;font-size:12px;color:#26c98d;border:1px solid #267158;border-radius:5px;padding:4px 8px">DARVAS / RS</div>
 <div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner</div>
-</div><div style="color:#aec2d4;margin-bottom:14px">Daily/Weekly Darvas & VCP · Weekly first pullback to 20 MA · RS vs SPY/SPX · hover charts</div>''',unsafe_allow_html=True)
+</div><div style="color:#aec2d4;margin-bottom:14px">Darvas Breakout · VCP Pre-Breakout · First Pullback EMA 20W · RS vs SPY/SPX · hover charts</div>''',unsafe_allow_html=True)
 
 with st.sidebar:
     st.header('Data & universe')
     st.caption('Public Yahoo Finance OHLCV (adjusted), cached 15 min. NOT guaranteed real-time.')
     universe=st.selectbox('Stock universe',['Starter (growth leaders)','S&P 500','Nasdaq-100','Imported SCTR list','Custom list'])
     ticker_text=st.text_area('Additional / custom tickers',height=105,placeholder='NVDA, PLTR, ANET, VRT, ...')
-    max_symbols=st.number_input('Max tickers to scan',min_value=10,max_value=650,value=150,step=25)
+    max_symbols=st.number_input('Max tickers to scan',min_value=10,max_value=650,value=500,step=25)
     st.divider()
     st.subheader('StockCharts · SCTR')
     score_upload=st.file_uploader('CSV with ticker + SCTR (optional sector / industry)',type=['csv'],help='Optional CSV exported from StockCharts. Alternatively paste the public SCTR table below.')
@@ -224,108 +226,148 @@ with st.sidebar:
     st.divider()
     st.caption('TIP: Hover over a result ticker to see the actual price chart, EMA, box, volume and RS.')
 
-with st.form('scan_settings'):
-    st.markdown('### 01 · Screener universe & settings')
-    u1,u2,u3,u4,u5=st.columns([1,1,1.1,1.1,1.2])
-    with u1:timeframe=st.selectbox('Timeframe',['Weekly','Daily'])
-    with u2:direction=st.selectbox('Direction',['Long','Short'])
-    with u3:benchmark=st.selectbox('RS benchmark',['SPY','SPX (^GSPC)'])
-    with u4:mode_label=st.selectbox('Scan mode',['Both (Breakout + Pre-Breakout)','Breakout only','Pre-Breakout only','All incl. Inside Box'])
-    with u5:lookback=st.selectbox('Breakout freshness: last N bars',[1,2,3,5,10,20],index=2,help='Completed Daily or Weekly bars; 1 = only the latest completed candle.')
-    mode={'Both (Breakout + Pre-Breakout)':'Both','Breakout only':'Breakout',
-          'Pre-Breakout only':'Near breakout','All incl. Inside Box':'All setups'}[mode_label]
-    exchange_filter=st.multiselect('Exchange filter (leave blank for all US exchanges)',['NASDAQ','NYSE','AMEX','NYSE Arca'],default=[])
 
-    if timeframe=='Weekly':
-        strategy=st.selectbox('Strategy / setup to scan',
-            ['Darvas + VCP','First Pullback to 20W MA','All (Darvas/VCP + First Pullback)'],index=2,
-            help='Pullback is exclusively Weekly and uses 20-WEEK EMA by default, not 20-day MA.')
-    else:
-        strategy='Darvas + VCP'
-        st.caption('First Pullback to 20W MA is Weekly only. Daily charts scan Darvas/VCP.')
-    st.caption('Darvas = rezistența maximului intervalului selectat. VCP = rezistența ultimei contracții. Weekly pullback = primul retest 20W MA după breakout și impuls.')
-    pattern_family=st.radio('Pattern family', ['Both (Darvas + Tight VCP)','Darvas Box only','Tight Base / VCP only'],horizontal=True,
-        help='Darvas: full selected range high. VCP: recent contraction after a wider range, with a local tight pivot and optional volume dry-up.')
-    pattern_family={'Both (Darvas + Tight VCP)':'Both','Darvas Box only':'Darvas','Tight Base / VCP only':'VCP'}[pattern_family]
-    if direction=='Short' and pattern_family=='VCP':
-        st.warning('This release implements VCP for Long only. For Short use the Darvas Box family.')
-    st.markdown('### 02 · Box entry filters')
-    b1,b2,b3,b4=st.columns(4)
-    with b1:min_bars=st.number_input('Minimum consolidation bars',min_value=3,max_value=52,value=6)
-    with b2:max_bars=st.number_input('Maximum consolidation bars',min_value=3,max_value=80,value=16)
-    with b3:max_box=st.number_input('Maximum box range (%)',min_value=1.0,max_value=100.0,value=20.0,step=1.0)
-    with b4:stop_pos=st.number_input('Stop inside box from bottom (%)',min_value=0,max_value=100,value=33)
-    c1,c2,c3,c4=st.columns(4)
-    with c1:max_risk=st.number_input('Maximum stop-loss risk (%)',min_value=1.0,max_value=100.0,value=16.0)
-    with c2:breakout_min=st.number_input('Breakout clearance MIN (%)',min_value=0.0,max_value=40.0,value=4.0,step=0.5)
-    with c3:breakout_max=st.number_input('Breakout clearance MAX (%)',min_value=0.5,max_value=1000.0,value=1000.0,step=1.0)
-    with c4:close_strength=st.number_input('Minimum close strength (%)',min_value=0,max_value=100,value=75)
-    d1,d2,d3,d4=st.columns(4)
-    with d1:min_volume=st.number_input('Minimum volume increase vs prior bar (%)',min_value=-100.0,max_value=1000.0,value=1.0)
-    with d2:entry_buffer=st.number_input('Entry buffer beyond close (%)',min_value=0.0,max_value=10.0,value=0.01,step=0.01,format='%.2f')
-    with d3:ema_on=st.checkbox('20 EMA confirmation',value=True)
-    with d4:macd_on=st.checkbox('MACD line above signal (Long)',value=True)
-    with st.expander('Advanced box detection',expanded=False):
+# Presets are selected OUTSIDE the form, so the chosen strategy is visible and
+# a change immediately rebuilds the settings with that preset's defaults.
+PRESETS = {
+    'Darvas Breakout': {
+        'timeframe':'Weekly','strategy':'Darvas + VCP','pattern_family':'Darvas',
+        'mode':'Breakout','lookback':3,'breakout_min':4.0,'close_strength':75,
+        'min_volume':1.0,'ema_on':True,'macd_on':True,
+    },
+    'VCP Pre-Breakout': {
+        'timeframe':'Weekly','strategy':'Darvas + VCP','pattern_family':'VCP',
+        'mode':'Near breakout','lookback':3,'breakout_min':4.0,
+        'close_strength':60,'min_volume':0.0,'ema_on':True,'macd_on':False,
+    },
+    'First Pullback EMA 20W': {
+        'timeframe':'Weekly','strategy':'First Pullback to 20W MA','pattern_family':'Both',
+        'mode':'Both','lookback':3,'breakout_min':4.0,'close_strength':75,
+        'min_volume':1.0,'ema_on':True,'macd_on':True,
+    },
+}
+
+st.markdown('### Quick strategy presets')
+preset_name=st.selectbox('Choose your setup',list(PRESETS),
+    help='A preset gives recommended starting parameters, not a validated trading signal. Open Advanced Filters to customize.')
+preset=PRESETS[preset_name]
+if st.session_state.get('_active_scan_preset') != preset_name:
+    st.session_state.pop('results', None)  # Do not show results from a different preset.
+    st.session_state['_active_scan_preset'] = preset_name
+st.caption({
+    'Darvas Breakout': 'Completed weekly/daily close above the high of the prior box; classic breakout confirmation.',
+    'VCP Pre-Breakout': 'Late tight consolidation after a wider range; search before the local pivot is broken.',
+    'First Pullback EMA 20W': 'Weekly only: breakout, several weeks of advance, and first return toward the rising 20-week EMA.',
+}[preset_name])
+
+with st.form('scan_settings_'+preset_name.replace(' ','_')):
+    st.markdown('### 01 · Quick filters')
+    q1,q2,q3,q4=st.columns(4)
+    with q1:
+        timeframe=st.selectbox('Chart timeframe', ['Weekly'] if preset_name=='First Pullback EMA 20W' else ['Weekly','Daily'],
+            index=0, help='The first pullback strategy is always WEEKLY.')
+    with q2:benchmark=st.selectbox('RS benchmark',['SPY','SPX (^GSPC)'])
+    with q3:lookback=st.selectbox('Signal freshness · completed bars',[1,2,3,5,10,20],index=2,
+        help='A breakout/bounce must have occurred within the last N completed candles.')
+    with q4:sctr_min=st.number_input('Min SCTR (StockCharts)',min_value=0,max_value=100,value=70)
+    q5,q6=st.columns([1.9,1.1])
+    with q5:rs_mode=st.selectbox('Relative Strength filter',
+        ['3M outperform','Off','52w RS high','3M outperform + 52w high'],
+        help='3M outperformance uses the stock/benchmark ratio, not absolute stock return.')
+    with q6:sctr_on=st.checkbox('Require imported SCTR',value=(universe=='Imported SCTR list'),
+        help='Stocks without imported SCTR are excluded when enabled.')
+    st.caption('All other criteria are configured for the selected strategy. Expand only if you need to customize them.')
+
+    with st.expander('⚙ Advanced Filters — optional',expanded=False):
+        st.markdown('#### Universe, pattern & signal filters')
+        x1,x2,x3=st.columns(3)
+        with x1:
+            direction=st.selectbox('Direction',['Long','Short'] if preset_name=='Darvas Breakout' else ['Long'])
+        with x2:
+            mode_options=['Both (Breakout + Pre-Breakout)','Breakout only','Pre-Breakout only','All incl. Inside Box']
+            default_label={'Breakout':'Breakout only','Near breakout':'Pre-Breakout only',
+                'Both':'Both (Breakout + Pre-Breakout)','All setups':'All incl. Inside Box'}[preset['mode']]
+            mode_label=st.selectbox('Signal type',mode_options,index=mode_options.index(default_label))
+        with x3:
+            families=['Darvas Box only','Tight Base / VCP only','Both (Darvas + Tight VCP)']
+            family_label={'Darvas':'Darvas Box only','VCP':'Tight Base / VCP only',
+                'Both':'Both (Darvas + Tight VCP)'}[preset['pattern_family']]
+            family_choice=st.selectbox('Pattern family',families,index=families.index(family_label),
+                disabled=preset_name=='First Pullback EMA 20W',
+                help='For the pullback strategy, the initial breakout is detected by the pullback engine.')
+        mode={'Both (Breakout + Pre-Breakout)':'Both','Breakout only':'Breakout',
+              'Pre-Breakout only':'Near breakout','All incl. Inside Box':'All setups'}[mode_label]
+        pattern_family={'Darvas Box only':'Darvas','Tight Base / VCP only':'VCP',
+                        'Both (Darvas + Tight VCP)':'Both'}[family_choice]
+        strategy=preset['strategy']
+        exchange_filter=st.multiselect('Exchange filter (empty = no exchange lookup)',
+            ['NASDAQ','NYSE','AMEX','NYSE Arca'],default=[])
+        if direction=='Short' and pattern_family in ('VCP','Both'):
+            st.caption('Short signals are evaluated by Darvas only. The VCP model detects long setups.')
+
+        st.markdown('#### Darvas Box · breakout confirmation')
+        b1,b2,b3,b4=st.columns(4)
+        with b1:min_bars=st.number_input('Minimum consolidation bars',min_value=3,max_value=52,value=6)
+        with b2:max_bars=st.number_input('Maximum consolidation bars',min_value=3,max_value=80,value=16)
+        with b3:max_box=st.number_input('Maximum box range (%)',min_value=1.0,max_value=100.0,value=20.0,step=1.0)
+        with b4:stop_pos=st.number_input('Stop inside box from bottom (%)',min_value=0,max_value=100,value=33)
+        c1,c2,c3,c4=st.columns(4)
+        with c1:max_risk=st.number_input('Maximum stop-loss risk (%)',min_value=1.0,max_value=100.0,value=16.0)
+        with c2:breakout_min=st.number_input('Darvas breakout clearance MIN (%)',min_value=0.0,max_value=40.0,value=preset['breakout_min'],step=0.5)
+        with c3:breakout_max=st.number_input('Breakout clearance MAX (%)',min_value=0.5,max_value=1000.0,value=1000.0,step=1.0)
+        with c4:close_strength=st.number_input('Minimum close strength (%)',min_value=0,max_value=100,value=preset['close_strength'])
+        d1,d2,d3,d4=st.columns(4)
+        with d1:min_volume=st.number_input('Minimum volume increase vs prior bar (%)',min_value=-100.0,max_value=1000.0,value=preset['min_volume'])
+        with d2:entry_buffer=st.number_input('Entry buffer beyond close (%)',min_value=0.0,max_value=10.0,value=0.01,step=0.01,format='%.2f')
+        with d3:ema_on=st.checkbox('20 EMA confirmation',value=preset['ema_on'])
+        with d4:macd_on=st.checkbox('MACD above signal (long)',value=preset['macd_on'])
         e1,e2,e3,e4=st.columns(4)
         with e1:touches=st.number_input('Minimum resistance/support touches',min_value=1,max_value=8,value=1)
         with e2:touch_tol=st.number_input('Touch tolerance (%)',min_value=0.1,max_value=10.0,value=2.5,step=0.5)
-        with e3:near_distance=st.number_input('Near-box: max distance from boundary (%)',min_value=0.1,max_value=30.0,value=5.0)
-        with e4:completed_only=st.checkbox('Completed candles only (default)',value=True)
-        e5,e6,e7=st.columns([1.5,1,1.5])
-        with e5:resistance_basis=st.selectbox('Box resistance method',
-             ['Highest wick (range box)','Highest close (early-warning, non-classic)'],index=0,
-             help='Wick = maximum High of the N bars. Close = highest closing price and ignores wicks; not a classical Darvas breakout.')
-        with e6:confirmed_pivot=st.checkbox('Require 3 lower highs after pivot',value=False,
-             help='Requires a confirmed swing high BEFORE breakout, with 3 completed following lower highs. Works with wick-based box only.')
-        with e7:max_inside_distance=st.number_input('Inside Box: maximum gap below resistance (%)',min_value=5.0,max_value=100.0,value=20.0,step=2.5)
+        with e3:near_distance=st.number_input('Pre-Breakout: max distance (%)',min_value=0.1,max_value=30.0,value=5.0)
+        with e4:max_inside_distance=st.number_input('Inside box: max gap (%)',min_value=5.0,max_value=100.0,value=20.0)
+        e5,e6,e7=st.columns([2,1.7,1.6])
+        with e5:resistance_basis=st.selectbox('Darvas resistance method',
+            ['Highest wick (range box)','Highest close (early-warning, non-classic)'],index=0)
+        with e6:confirmed_pivot=st.checkbox('Require 3 lower highs after pivot',value=False)
+        with e7:completed_only=st.checkbox('Completed candles only',value=True)
 
-    with st.expander('Tight Base / VCP detection (ABBV-style)',expanded=True):
-        st.caption('Late tight range is measured over N completed bars before the signal, and compared with the preceding N bars. Pivot = highest HIGH in late range. Volume dry-up is optional. This is a mechanical VCP proxy, not a discretionary Minervini certification.')
+        st.markdown('#### Tight Base / VCP · last contraction')
+        st.caption('Late N-bar range compared with the previous N bars; local pivot = high of FINAL contraction.')
         v1,v2,v3,v4=st.columns(4)
         with v1:vcp_tight=st.number_input('VCP max final box width (%)',min_value=1.0,max_value=40.0,value=12.0,step=1.0)
-        with v2:vcp_range=st.number_input('VCP latest/earlier range max ratio',min_value=0.1,max_value=1.0,value=0.8,step=0.05,
-            help='0.80 means the final base range must be at least 20% tighter than the older range.')
-        with v3:vcp_atr=st.number_input('VCP latest/earlier avg TR max ratio',min_value=0.1,max_value=1.5,value=0.95,step=0.05,
-            help='Average relative true range of individual bars, current base vs older range.')
-        with v4:vcp_clear=st.number_input('VCP breakout close above pivot MIN (%)',min_value=0.0,max_value=10.0,value=0.15,step=0.05,
-            help='Independent of the 4% breakout clearance required for the classic Darvas setup.')
+        with v2:vcp_range=st.number_input('Latest / earlier range max ratio',min_value=0.1,max_value=1.0,value=0.8,step=0.05)
+        with v3:vcp_atr=st.number_input('Latest / earlier avg TR max ratio',min_value=0.1,max_value=1.5,value=0.95,step=0.05)
+        with v4:vcp_clear=st.number_input('VCP breakout above pivot MIN (%)',min_value=0.0,max_value=10.0,value=0.15,step=0.05)
         v5,v6,v7=st.columns(3)
-        with v5:vcp_dry=st.checkbox('Require volume dry-up during VCP',value=False)
-        with v6:vcp_vol=st.number_input('Max latest/earlier volume ratio',min_value=0.1,max_value=2.0,value=0.9,step=0.05)
-        with v7:vcp_stop=st.number_input('VCP stop buffer below last base low (%)',min_value=0.0,max_value=5.0,value=0.3,step=0.1)
-    if timeframe=='Weekly':
-        with st.expander('First pullback to 20-WEEK MA (MA-style)', expanded='Pullback' in strategy):
-            st.caption('20-WEEK EMA (sau SMA) · breakout dintr-o bază anterioară · minimum câteva săptămâni de avans · fără atingeri MA înainte · prima apropiere/atingere/confirmare. Semnalele WATCH nu sunt intrări executate.')
-            pb1,pb2,pb3,pb4=st.columns(4)
-            with pb1:pb_ma=st.selectbox('20W moving average',['EMA','SMA'])
-            with pb2:pb_stage=st.selectbox('Pullback stage',['All','Watch','First touch','Bounce'])
-            with pb3:pb_upweeks=st.number_input('Weeks of uptrend after breakout MIN',min_value=2,max_value=10,value=3)
-            with pb4:pb_maxweeks=st.number_input('Max weeks since breakout',min_value=4,max_value=36,value=16)
-            pb5,pb6,pb7,pb8=st.columns(4)
-            with pb5:pb_advance=st.number_input('Impulse gain above breakout MIN (%)',min_value=2.0,max_value=100.0,value=8.0,step=1.0)
-            with pb6:pb_touch=st.number_input('First MA touch tolerance (%)',min_value=0.0,max_value=10.0,value=2.0,step=0.5,
-                 help='Weekly Low can be up to this percentage ABOVE 20W MA and count as a first touch.')
-            with pb7:pb_watch=st.number_input('Watch: low above MA max gap (%)',min_value=2.0,max_value=20.0,value=5.0,step=0.5)
-            with pb8:pb_undercut=st.number_input('Max low undercut below MA (%)',min_value=0.0,max_value=12.0,value=2.5,step=0.5)
-            pb9,pb10,pb11,pb12=st.columns(4)
-            with pb9:pb_breakperiod=st.number_input('Pre-breakout highest-high window (weeks)',min_value=4,max_value=20,value=8)
-            with pb10:pb_breakclear=st.number_input('Prior breakout close above high (%)',min_value=0.0,max_value=10.0,value=0.5,step=0.25)
-            with pb11:pb_stop=st.number_input('Stop below touch-week low (%)',min_value=0.0,max_value=10.0,value=0.5,step=0.25)
-            with pb12:pb_risk=st.number_input('Pullback maximum entry risk (%)',min_value=1.0,max_value=40.0,value=16.0,step=1.0)
-    else:
-        pb_ma='EMA';pb_stage='All';pb_upweeks=3;pb_maxweeks=16;pb_advance=8.0;pb_touch=2.0
-        pb_watch=5.0;pb_undercut=2.5;pb_breakperiod=8;pb_breakclear=.5;pb_stop=.5;pb_risk=16.0
-    st.markdown('### 03 · Relative Strength + SCTR')
-    f1,f2,f3,f4=st.columns(4)
-    with f1:rs_mode=st.selectbox('RS vs benchmark filter',['3M outperform','Off','52w RS high','3M outperform + 52w high'])
-    with f2:rs_min=st.number_input('Min RS 3-month outperformance (%)',min_value=-100.0,max_value=1000.0,value=0.0,step=1.0)
-    with f3:rs_pctl=st.number_input('Min RS rank percentile in scanned universe',min_value=0,max_value=100,value=0,step=5,help='Calculated among ALL downloaded universe symbols, not a proprietary RS rank.')
-    with f4:sctr_min=st.number_input('Min SCTR (StockCharts)',min_value=0,max_value=100,value=70)
-    g1,g2=st.columns([1,3])
-    with g1:sctr_on=st.checkbox('Enforce imported SCTR',value=False)
-    with g2:st.caption('SCTR este oficial doar când este importat din StockCharts; RS este calculat local din OHLCV. Fără Market Cap și fără alte scoruri externe.')
-    submitted=st.form_submit_button('▶ RUN SCREENER',type='primary',use_container_width=True)
+        with v5:vcp_dry=st.checkbox('Require VCP volume dry-up',value=False)
+        with v6:vcp_vol=st.number_input('Max latest / earlier volume ratio',min_value=0.1,max_value=2.0,value=0.9,step=0.05)
+        with v7:vcp_stop=st.number_input('VCP stop buffer below base low (%)',min_value=0.0,max_value=5.0,value=0.3,step=0.1)
 
+        st.markdown('#### First Pullback · Weekly 20 MA')
+        st.caption('Only active for First Pullback EMA 20W preset. WATCH is not a confirmed entry.')
+        pb1,pb2,pb3,pb4=st.columns(4)
+        with pb1:pb_ma=st.selectbox('20-week moving average',['EMA','SMA'])
+        with pb2:pb_stage=st.selectbox('Pullback stage',['All','Watch','First touch','Bounce'])
+        with pb3:pb_upweeks=st.number_input('Weeks of uptrend after breakout MIN',min_value=2,max_value=10,value=3)
+        with pb4:pb_maxweeks=st.number_input('Max weeks since breakout',min_value=4,max_value=36,value=16)
+        pb5,pb6,pb7,pb8=st.columns(4)
+        with pb5:pb_advance=st.number_input('Impulse gain above breakout MIN (%)',min_value=2.0,max_value=100.0,value=8.0,step=1.0)
+        with pb6:pb_touch=st.number_input('First MA touch tolerance (%)',min_value=0.0,max_value=10.0,value=2.0,step=0.5)
+        with pb7:pb_watch=st.number_input('Watch: low above MA max gap (%)',min_value=2.0,max_value=20.0,value=5.0,step=0.5)
+        with pb8:pb_undercut=st.number_input('Max low undercut below MA (%)',min_value=0.0,max_value=12.0,value=2.5,step=0.5)
+        pb9,pb10,pb11,pb12=st.columns(4)
+        with pb9:pb_breakperiod=st.number_input('Pre-breakout highest-high window (weeks)',min_value=4,max_value=20,value=8)
+        with pb10:pb_breakclear=st.number_input('Prior breakout close above high (%)',min_value=0.0,max_value=10.0,value=0.5,step=0.25)
+        with pb11:pb_stop=st.number_input('Stop below touch-week low (%)',min_value=0.0,max_value=10.0,value=0.5,step=0.25)
+        with pb12:pb_risk=st.number_input('Pullback maximum entry risk (%)',min_value=1.0,max_value=40.0,value=16.0,step=1.0)
+
+        st.markdown('#### Additional RS thresholds')
+        f1,f2=st.columns(2)
+        with f1:rs_min=st.number_input('Min 3M outperformance vs benchmark (%)',min_value=-100.0,max_value=1000.0,value=0.0,step=1.0)
+        with f2:rs_pctl=st.number_input('Min RS rank percentile in scanned universe',min_value=0,max_value=100,value=0,step=5)
+
+    submitted=st.form_submit_button('▶ RUN SCREENER',type='primary',use_container_width=True)
 if pb_watch<pb_touch and timeframe=='Weekly':
     st.error('Pullback WATCH max gap must be >= first MA touch tolerance.');st.stop()
 if pb_maxweeks<=pb_upweeks and timeframe=='Weekly':
@@ -344,6 +386,13 @@ extra=parse_tickers(ticker_text)
 tickers=list(dict.fromkeys(([t for t, v in scores.items() if 'sctr' in v] if universe=='Imported SCTR list' else (base if universe!='Custom list' else []))+extra))[:int(max_symbols)]
 st.caption(f'Universe selected: **{len(tickers)} symbols** / {(sum('sctr' in v for v in scores.values()) if universe=='Imported SCTR list' else len(base))+len(extra)} requested before deduplication and scan limit · RS = (stock / benchmark) momentum · 3M = 13 weekly bars / 63 daily bars.')
 if submitted:
+    required_engine_version='v6.1'
+    installed_core=getattr(screener_engine,'ENGINE_API_VERSION','older/unknown')
+    installed_pullback=getattr(pullback_engine,'ENGINE_API_VERSION','older/unknown')
+    if installed_core!=required_engine_version or installed_pullback!=required_engine_version:
+        st.error('Version mismatch between app.py and screening modules. Upload ALL v6 files from the ZIP (not only app.py): screener_core.py and pullback_core.py must also be v6.1.')
+        st.code(f'app.py requires {required_engine_version}; screener_core.py={installed_core}; pullback_core.py={installed_pullback}')
+        st.stop()
     if not tickers:
         st.error('Add tickers in the sidebar for a custom scan.');st.stop()
     with st.spinner(f'Downloading daily price histories for {len(tickers)} stocks, then evaluating {timeframe.lower()} breakout/pullback setups...'):
@@ -353,7 +402,8 @@ if submitted:
         bench=only_completed(raw.get(benchmark_ticker,pd.DataFrame()),completed_only,timeframe)
         if len(bench)<80:
             st.error('Benchmark OHLCV could not be retrieved. Scan cancelled — no fabricated results.');st.stop()
-        rules=Rules(direction=direction,minimum_bars=int(min_bars),maximum_bars=int(max_bars),
+        try:
+            rules=Rules(direction=direction,minimum_bars=int(min_bars),maximum_bars=int(max_bars),
           max_box_pct=max_box,stop_in_box_pct=stop_pos,max_stop_pct=max_risk,
           min_breakout_pct=breakout_min,max_breakout_pct=breakout_max,
           min_close_strength=close_strength,min_volume_increase=min_volume,
@@ -366,12 +416,16 @@ if submitted:
           vcp_max_atr_ratio=vcp_atr, vcp_require_dry_volume=vcp_dry,
           vcp_max_volume_ratio=vcp_vol, vcp_breakout_min_pct=vcp_clear,
           vcp_stop_buffer_pct=vcp_stop)
-        pullback_rules=PullbackRules(ma_kind=pb_ma,breakout_lookback=int(pb_breakperiod),
+            pullback_rules=PullbackRules(ma_kind=pb_ma,breakout_lookback=int(pb_breakperiod),
             breakout_clearance_pct=pb_breakclear,min_advance_weeks=int(pb_upweeks),
             max_weeks_since_breakout=int(pb_maxweeks),min_advance_pct=pb_advance,
             touch_tolerance_pct=pb_touch,max_undercut_pct=pb_undercut,
             watch_distance_pct=pb_watch,stop_buffer_pct=pb_stop,max_risk_pct=pb_risk,
             max_signal_age=int(lookback),stage_mode=pb_stage)
+        except TypeError as exc:
+            st.error('Incompatible engine parameters. Replace app.py, screener_core.py AND pullback_core.py together from the same v6 archive.')
+            st.code(f'{type(exc).__name__}: {exc}')
+            st.stop()
         candidates=[];rs_all={};available=0
         for ticker in tickers:
             d=only_completed(raw.get(ticker,pd.DataFrame()),completed_only,timeframe)
@@ -456,6 +510,6 @@ if 'results' in st.session_state:
         st.markdown('**First Pullback 20W MA**: completed WEEKLY candles only; breakout over a previous N-week high, at least several weekly candles of advance, min impulse, no interim pullback to the 20-week MA tolerance zone, a rising MA, and the first near/touch/bounce. WATCH is not a trigger; FIRST TOUCH is a support-test candidate; BOUNCE requires a weekly close above the touch-week high. Entry/stop are reference levels, not filled orders.\n\n**VCP** = a 2-stage contraction proxy: final N-bar range smaller than preceding N-bar range, intrabar true range contracting, optional volume dry-up. Pivot is the high of the FINAL tight range, not the absolute high of the whole base. VCP breakout requires its own smaller confirmation percentage; stop uses a buffer under final contraction low. **Darvas** remains a separate rule family.\n\n**Box range** = (upper − lower) / lower across preceding N bars (wick high/low by default). **Breakout** = completed candle close at least X% above resistance; its candle is excluded from the box. **Close strength** = (close − low) / (high − low) on breakout candle. **Volume** = change vs immediately prior bar. **Initial stop** = box bottom + 33% × box height (long); **risk** uses entry beyond breakout close. **RS 3M** = return of (stock close / benchmark close) ratio over 13 weekly or 63 daily bars. **RS rank** = percentile within downloaded universe (not proprietary SCTR).')
         st.caption('Prior pivot shown in yellow is an earlier *confirmed swing-high reference*, not the box ceiling; it can already have been breached. Highest close resistance is an experimental early-warning alternative, NOT a classic Darvas breakout. Weekly scans omit an incomplete current week. Historical 412% return reported in the video is NOT reproduced by this app; this is a current screener, not a point-in-time survivorship-free portfolio backtest. Free public sources can be delayed, incomplete, adjusted or rate-limited. No market-cap filter is applied.')
 else:
-    st.info('Choose your universe and filters, then click **RUN DARVAS SCAN**. No synthetic or prefilled scan results are shown.')
+    st.info('Choose a quick preset, provide an SCTR universe or custom tickers, then click **RUN SCREENER**. No synthetic results are shown.')
 
 st.markdown('''<div style="border-top:1px solid #273b4b;margin-top:18px;padding-top:12px;color:#8398ad;font-size:12px">DARVAS RS • Technical research dashboard • Not investment advice • Does not place orders • SCTR requires imported StockCharts snapshot</div>''',unsafe_allow_html=True)

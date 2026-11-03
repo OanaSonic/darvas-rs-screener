@@ -1,46 +1,39 @@
-# DARVAS RS — v5 · Weekly First Pullback to 20 MA
+# Darvas RS Screener v6.1 — Quick Presets & TypeError fix
 
-Actualizare pentru proiectul Streamlit existent `OanaSonic/darvas-rs-screener`. Nu crea un repository nou.
+Streamlit dashboard for StockCharts SCTR imports (CSV or copied SCTR Reports table), weekly/daily Darvas and VCP screening, and first pullback to a 20-week moving average. Yahoo Finance supplies adjusted historical OHLCV. This is **not real-time data** and is **not a backtesting engine**.
 
-## Nou: prima revenire la 20-week MA după breakout (exemplu: MA)
+## What's fixed in v6.1
 
-În `Strategy / setup to scan` (când `Timeframe = Weekly`) alegi:
+- **`TypeError` on `Rules(...)`:** `app.py` and `screener_core.py` now have matching interfaces. An explicit API version handshake checks `screener_core.py` and `pullback_core.py` **before downloading any market data** and shows helpful instructions instead of an opaque Python traceback if one module is stale.
+- Three **Quick Presets** immediately visible:
+  1. **Darvas Breakout** — classical high-of-box breakout with 4% minimum breakout clearance, close-strength/volume/EMA/MACD confirmation; default Weekly but Daily available.
+  2. **VCP Pre-Breakout** — final contraction smaller than the preceding range, approaching final local pivot; default Weekly but Daily available. An experimental mechanical contraction proxy, not a guaranteed VCP pattern.
+  3. **First Pullback EMA 20W** — Weekly only; first approach, touch or confirmed rebound after a prior breakout and upward impulse.
+- A single **Advanced Filters — optional** panel, closed by default, contains the rest of the inputs: pattern type, exchange, Darvas, VCP, pullback and additional RS settings.
+- Selecting a new preset clears results from the previous preset; no misleading old results shown.
+- The default scan limit is **500 tickers**, enough for a typical pasted SCTR list. Scans can take time and Yahoo may rate-limit.
+- Keeps user-requested removals: **no Market Cap filter**, no **Barchart**, **Quality**, or **Growth** fields/columns.
+- Preserves the dark theme, hover charts and diagnostic candidate explorer.
 
-- `Darvas + VCP` — modurile anterioare, pe Weekly sau Daily;
-- `First Pullback to 20W MA` — **exclusiv pe Weekly**;
-- `All (Darvas/VCP + First Pullback)` — rezultatele ambelor familii de strategii, inclusiv două rânduri pentru același simbol dacă apar ambele tipuri de setup.
+## Install / update an existing GitHub repository
 
-Detectorul First Pullback are următoarele condiții mecanice, configurabile din interfață:
+1. Download and **unzip the release**.
+2. In `OanaSonic/darvas-rs-screener`, use **Add file → Upload files** and upload the **files inside the extracted ZIP** (do not upload the ZIP itself). Commit the changes to branch `main`.
+3. **Replace ALL five Python files together**: `app.py`, `screener_core.py`, `pullback_core.py`, `hover_chart.py`, and `sctr_paste.py`; also upload `requirements.txt` and `.streamlit/config.toml` as supplied. The two `*_core.py` files are mandatory; do not mix v6.1 `app.py` with older modules.
+4. Streamlit Cloud should redeploy the `app.py` entrypoint after GitHub commits. If the older version remains, use **Manage app → Reboot** and inspect logs. Paste SCTR table again if the app session resets.
+5. For the previous `TypeError`, if the new version shows a version-mismatch warning, confirm `screener_core.py` and `pullback_core.py` were uploaded **to the repository root**, not a subfolder and not as `filename (1).py`.
 
-1. Prețul **închide deasupra maximului celor N săptămâni precedente** (8 implicit), cu clearance minim 0,5%, iar baza anterioară nu este excesiv de largă (implicit maxim 35%). Acesta e un proxy algoritmic pentru breakout, nu copiere exactă a unui breakout desenat discreționar.
-2. Urmează cel puțin **3 săptămâni complete de avans înaintea pullback-ului**, în intervalul de cel mult 16 săptămâni de la breakout. Impulsul trebuie să atingă cel puțin +8% față de close-ul breakout-ului.
-3. În săptămânile dintre breakout și retest, **minimele nu au atins încă banda de toleranță** a mediei de 20 de săptămâni: săptămâna detectată este prima apropiere relevantă de medie.
-4. Media **20W EMA** (implicit) sau **20W SMA** este în creștere față de acum 3 săptămâni.
-5. Categoriile sunt:
-   - `PULLBACK WATCH`: ultimul Low săptămânal este la 2–5% peste medie, neatinse încă. **Nu reprezintă un trigger de intrare**, Entry/Stop/Risk rămân N/A.
-   - `FIRST MA TOUCH`: Low se află la maximum +2% deasupra / −2,5% sub medie, iar închiderea rămâne aproape deasupra acesteia. Entry **prospectiv** = maximul săptămânii de retest + buffer de 0,1%; stop orientativ sub minimul săptămânii −0,5%.
-   - `BOUNCE CONFIRMED`: una dintre următoarele 1–2 săptămâni **închide peste maximul săptămânii primului touch** și peste MA 20W, fără să o străpungă masiv. Entry/Stop reprezintă nivelurile trigger-ului și invalidării, **nu ordine executate**.
-6. Filtrele SCTR (import/paste din StockCharts), RS vs SPY/SPX și RSI ranking (rank din RS, nu RSI indicator) sunt păstrate; datele Yahoo publice pot fi întârziate. `Breakout freshness: last N bars` funcționează și pentru vechimea semnalelor de pullback.
+## Quick use
 
-**Grafic la hover** pentru pullback: lumânări săptămânale, EMA/SMA 20W, nivelul breakout-ului anterior, data breakout-ului, marcajul pentru primul retest/atingere și pentru bounce, volum și RS vs benchmark. Pentru Darvas/VCP rămân box-urile anterioare. Dacă un ticker are 2 strategii, hover afișează **graficul rândului corespunzător**, nu primul rând cu acel ticker.
+- Paste the copied table in the **Paste SCTR Reports — fără CSV** sidebar expander, and select **Imported SCTR list**. The data are a timestamp-less snapshot from StockCharts; replace periodically.
+- Choose one of the three presets. Set the benchmark and (optionally) the signal freshness, SCTR minimum and RS filter.
+- Click **RUN SCREENER**. The green/red signals, charts and result exports come from current available historical OHLCV; missing tickers are not invented.
+- To customize close strength, VCP range, other indicators, etc., open **Advanced Filters — optional**. It stays closed unless needed.
 
-## Alte modificări păstrate din v4
+## Data and strategy caveats
 
-- **Fără Market Cap** și fără interogări Yahoo pentru capitalizare; lipsa metadatelor cap nu elimină tickere. SCTR nu este o garanție că un simbol e large cap.
-- **Fără Barchart, Quality și Growth** din tabel, interfață și CSV.
-- `BREAKOUT`, `PRE-BREAKOUT`, `IN BOX` și `VCP / tight base` pe Weekly/Daily.
-- În tabel: signal age, last close, extension from entry, SCTR și relative strength; hover pe ticker pentru grafic, click pentru fixare.
-- VCP folosește numai ultima contracție drept box de intrare, diferită de box-ul clasic Darvas.
+A `BOUNCE CONFIRMED` signal is a research flag and not an executable buy order. Weekly scans exclude the current incomplete week. RS percentile is computed within the downloaded universe; SCTR is taken from imported StockCharts text or CSV. Yahoo data can be delayed, rate-limited or incomplete. Any backtested returns in the cited video are third-party claims, not reproduced by this screener. None of the displayed signals constitutes investment advice.
 
-## Instalare în repository-ul existent
+## Tests
 
-1. Dezarhivează ZIP-ul și încarcă fișierele din rădăcina arhivei la `github.com/OanaSonic/darvas-rs-screener` → **Add file → Upload files**.
-2. Înlocuiește `app.py`, `screener_core.py`, `hover_chart.py`, `sctr_paste.py`, `README.md`, `requirements.txt`. **Adaugă obligatoriu noul `pullback_core.py`** la același nivel cu `app.py`. Fișierele `tests/` sunt opționale pentru deploy. Poți păstra `.streamlit/config.toml` existent.
-3. Apasă **Commit changes**. Streamlit Cloud ar trebui să redeployeze automat; dacă nu, `Manage app → Reboot app`.
-4. Alege `Weekly`, `First Pullback to 20W MA` și `Imported SCTR list` cu textul lipit din StockCharts. Lasă `RS` activ. Folosește `Max tickers` corespunzător listei importate.
-
-### Limitări
-
-Nu este o certificare Minervini/VCP și nu face backtest al tranzacțiilor: prețul de intrare teoretic nu presupune că ordinul a fost executat. Datele istorice sunt ajustate și posibil întârziate; săptămâna în curs este omisă când `Completed candles only` e activ. Scannerul poate să rateze consolidări desenate manual sau să semnaleze configurări mecanic valide dar slabe fundamental. Urmărește graficul și riscul înainte de orice tranzacție.
-
-Testare locală: `pip install -r requirements.txt`, apoi `streamlit run app.py`; teste `python -m pytest -q` (pytest e opțional).
+Run `python -m pytest -q` (requires `pytest`, `numpy`, `pandas`). All source files can be compiled with `python -m compileall -q .`. Streamlit Cloud / Yahoo network deployment must still be checked in the user's environment.

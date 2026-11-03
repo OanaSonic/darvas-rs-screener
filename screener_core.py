@@ -4,6 +4,9 @@ Prices use adjusted OHLC supplied by caller. No data retrieval here, so this
 module can be tested independently of Yahoo Finance and Streamlit.
 """
 from __future__ import annotations
+
+ENGINE_API_VERSION = 'v6.1'
+
 from dataclasses import dataclass
 from typing import Optional, Dict
 import math
