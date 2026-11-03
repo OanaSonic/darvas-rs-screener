@@ -19,6 +19,7 @@ import yfinance as yf
 
 from screener_core import Rules, normalized, find_setup, annotate_percentile, passes_rs
 from hover_chart import render_results
+from sctr_paste import parse_sctr_paste
 
 st.set_page_config(page_title='DARVAS RS | Breakout Scanner',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
 
@@ -53,7 +54,7 @@ CORE=['AAPL','MSFT','NVDA','AMZN','GOOGL','META','TSLA','AVGO','AMD','PLTR','NFL
 @st.cache_data(ttl=3600,show_spinner=False)
 def get_universe(name:str)->list[str]:
     if name=='Starter (growth leaders)': return CORE
-    if name=='Custom list': return []
+    if name in ('Custom list', 'Imported SCTR list'): return []
     url='https://en.wikipedia.org/wiki/List_of_S%26P_500_companies' if name=='S&P 500' else 'https://en.wikipedia.org/wiki/Nasdaq-100'
     try:
         headers={'User-Agent':'Mozilla/5.0 (Research Screener; public reference data)'}
@@ -243,7 +244,7 @@ st.markdown('''<div style="display:flex;gap:15px;align-items:center;margin:0 0 5
 with st.sidebar:
     st.header('Data & universe')
     st.caption('Public Yahoo Finance OHLCV (adjusted), cached 15 min. NOT guaranteed real-time.')
-    universe=st.selectbox('Stock universe',['Starter (growth leaders)','S&P 500','Nasdaq-100','Custom list'])
+    universe=st.selectbox('Stock universe',['Starter (growth leaders)','S&P 500','Nasdaq-100','Imported SCTR list','Custom list'])
     ticker_text=st.text_area('Additional / custom tickers',height=105,placeholder='NVDA, PLTR, ANET, VRT, ...')
     max_symbols=st.number_input('Max tickers to scan',min_value=10,max_value=650,value=150,step=25)
     st.divider()
@@ -253,9 +254,22 @@ with st.sidebar:
     if score_upload:
         scores,import_message=parse_scores_csv(score_upload.getvalue())
         st.caption(import_message)
+    with st.expander('📋 Paste SCTR Reports — fără CSV', expanded=False):
+        st.caption('Pe StockCharts SCTR Reports selectează tabelul (nu un screenshot), Cmd+C, apoi lipește aici cu Cmd+V. Scorurile sunt cele din momentul copierii; nu se actualizează automat.')
+        sctr_text=st.text_area('StockCharts SCTR table text',height=145,key='sctr_pasted',placeholder='Symbol\tName\tSector\tIndustry\tSCTR\tChg\tLast\tVolume\tMarket Cap\nIT\tGartner Group, Inc.\tTechnology\tComputer Services\t97.4\t+2.2\t235.26\t1,457,632\t14.448 B')
+        pasted, pasted_message=parse_sctr_paste(sctr_text)
+        if sctr_text.strip():
+            if pasted:
+                st.success(pasted_message)
+                for ticker, data in pasted.items():
+                    scores.setdefault(ticker, {}).update(data)
+                st.caption('SCTR lipit are prioritate față de SCTR din CSV pentru tickerele comune. Nu înlocuiește Quality sau Growth.')
+                as_csv=pd.DataFrame([{'Ticker':t,'SCTR':v['sctr'],'Sector':v.get('sector',''),'Industry':v.get('industry','')} for t,v in pasted.items()])
+                st.download_button('↓ Descarcă SCTR ca CSV',as_csv.to_csv(index=False).encode('utf-8-sig'),file_name='stockcharts_sctr_import.csv',mime='text/csv')
+            else:st.warning(pasted_message)
     api_key=st.text_input('Barchart OnDemand API key (optional)',type='password',help='Licensed API access only. This is not a Barchart website password.')
     enable_api=st.checkbox('Fetch Barchart getSignal through licensed API',value=False,disabled=not bool(api_key))
-    st.caption('SCTR is imported from StockCharts CSV; there is no public authenticated SCTR API wired into this app.')
+    st.caption('SCTR: CSV sau text copiat manual din StockCharts. Fără API public SCTR și fără actualizare automată.')
     st.divider()
     st.caption('TIP: Hover over a result ticker to see the actual price chart, EMA, box, volume and RS.')
 
@@ -318,8 +332,8 @@ if breakout_min>breakout_max:
 
 base=get_universe(universe)
 extra=parse_tickers(ticker_text)
-tickers=list(dict.fromkeys((base if universe!='Custom list' else [])+extra))[:int(max_symbols)]
-st.caption(f'Universe selected: **{len(tickers)} symbols** / {len(base)+len(extra)} requested before deduplication and cap · RS = (stock / benchmark) momentum · 3M = 13 weekly bars / 63 daily bars.')
+tickers=list(dict.fromkeys(([t for t, v in scores.items() if 'sctr' in v] if universe=='Imported SCTR list' else (base if universe!='Custom list' else []))+extra))[:int(max_symbols)]
+st.caption(f'Universe selected: **{len(tickers)} symbols** / {(sum('sctr' in v for v in scores.values()) if universe=='Imported SCTR list' else len(base))+len(extra)} requested before deduplication and cap · RS = (stock / benchmark) momentum · 3M = 13 weekly bars / 63 daily bars.')
 if submitted:
     if not tickers:
         st.error('Add tickers in the sidebar for a custom scan.');st.stop()
