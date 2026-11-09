@@ -5,6 +5,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import StringIO
+from typing import Iterable, Mapping
+import csv
 import copy
 import re
 from zoneinfo import ZoneInfo
@@ -278,7 +280,152 @@ FIELD_HELP = {
 # End of self-contained preset definitions.
 
 
-st.set_page_config(page_title='DARVAS RS v8.1 | Self-contained Hotfix',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
+# All v9 export functions are embedded here to prevent missing-module deployment errors.
+TICKER_RE = re.compile(r"[A-Z^][A-Z0-9.^-]{0,19}\Z")
+
+DETAIL_FIELDS = [
+    'ticker', 'exchange', 'pattern', 'status', 'signal_date', 'signal_age_bars',
+    'sctr', 'rs_3m', 'rs_percentile', 'rs_new_high', 'close', 'current_close',
+    'box_top', 'box_bottom', 'box_pct', 'bars', 'distance_pct', 'risk_pct',
+    'entry', 'stop', 'breakout_date', 'weeks_after_breakout', 'advance_pct',
+    'ma_kind', 'ma_distance_pct', 'touch_date', 'contraction_ratio',
+    'volume_ratio', 'sector', 'industry',
+]
+
+EXCHANGE_TO_TV = {
+    'NASDAQ':'NASDAQ', 'NMS':'NASDAQ', 'NCM':'NASDAQ', 'NGM':'NASDAQ',
+    'NYQ':'NYSE', 'NYSE':'NYSE', 'NYE':'NYSE',
+    'AMEX':'AMEX', 'ASE':'AMEX', 'AMERICAN':'AMEX',
+    # TradingView ordinarily groups NYSE Arca ETFs under AMEX, e.g. AMEX:SPY.
+    'NYSE ARCA':'AMEX', 'ARCA':'AMEX', 'PCX':'AMEX',
+}
+
+
+def clean_symbol(value: object) -> str | None:
+    if value is None: return None
+    symbol = str(value).strip().upper()
+    return symbol if TICKER_RE.fullmatch(symbol) else None
+
+
+def unique_symbols(records: Iterable[Mapping]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for record in records:
+        sym = clean_symbol(record.get('ticker'))
+        if sym and sym not in seen:
+            seen.add(sym)
+            result.append(sym)
+    return result
+
+
+def pattern_label(row: Mapping) -> str:
+    name = str(row.get('pattern') or '')
+    if name.startswith('VCP'): return 'VCP / Tight Base'
+    if name.startswith('First pullback'): return 'First Pullback EMA 20W'
+    if name == 'Darvas': return 'Darvas Box'
+    return 'Univers SCTR' if name == 'Universe' else name or 'Necunoscut'
+
+
+def _number(value) -> float | None:
+    if value is None or value == '': return None
+    try:
+        f = float(value)
+        return f if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def filter_rows(records: Iterable[Mapping], *, statuses: Iterable[str] = (),
+                patterns: Iterable[str] = (), text: str = '',
+                sctr_floor: float | None = None, rs_floor: float | None = None,
+                max_risk: float | None = None, max_age: int | None = None) -> list[dict]:
+    statuses, patterns = set(statuses), set(patterns)
+    term = text.strip().upper()
+    out = []
+    for row in records:
+        if statuses and str(row.get('status')) not in statuses: continue
+        if patterns and pattern_label(row) not in patterns: continue
+        if term and term not in str(row.get('ticker', '')).upper(): continue
+        if sctr_floor is not None and (_number(row.get('sctr')) is None or _number(row.get('sctr')) < sctr_floor): continue
+        if rs_floor is not None and (_number(row.get('rs_3m')) is None or _number(row.get('rs_3m')) < rs_floor): continue
+        if max_risk is not None and (_number(row.get('risk_pct')) is None or _number(row.get('risk_pct')) > max_risk): continue
+        if max_age is not None and (_number(row.get('signal_age_bars')) is None or _number(row.get('signal_age_bars')) > max_age): continue
+        out.append(dict(row))
+    return out
+
+
+def csv_bytes(records: Iterable[Mapping], fields: list[str] | None = None) -> bytes:
+    names = fields or DETAIL_FIELDS
+    output = StringIO(newline='')
+    writer = csv.DictWriter(output, fieldnames=names, extrasaction='ignore', lineterminator='\r\n')
+    writer.writeheader()
+    for row in records:
+        writer.writerow({k: row.get(k, '') if row.get(k) is not None else '' for k in names})
+    return output.getvalue().encode('utf-8-sig')
+
+
+def thinkorswim_csv(records: Iterable[Mapping]) -> bytes:
+    """A watchlist-ready CSV with the standard single Symbol header."""
+    return csv_bytes(({'Symbol': s} for s in unique_symbols(records)), ['Symbol'])
+
+
+def deepvue_text(records: Iterable[Mapping]) -> str:
+    """Deepvue's documented Add Symbol bulk paste accepts ticker text."""
+    symbols = unique_symbols(records)
+    return '\n'.join(symbols) + ('\n' if symbols else '')
+
+
+def tradingview_symbol(symbol: str) -> str:
+    # Yahoo names class shares with a dash; TradingView uses a period.
+    return re.sub(r'-([A-Z])$', r'.\1', symbol)
+
+
+def tradingview_txt(records: Iterable[Mapping],
+                    exchange_map: Mapping[str, str | None] | None = None,
+                    unknown_override: str | None = None) -> tuple[str, list[str]]:
+    """TradingView expects comma-separated EXCHANGE:SYMBOL in a .txt file.
+
+    Do not invent exchange prefixes. A missing/unknown venue is omitted unless
+    the user explicitly supplies an override or a verified per-symbol mapping.
+    """
+    rows = list(records)
+    exchange_map = exchange_map or {}
+    prefixed, unresolved, seen = [], [], set()
+    override = EXCHANGE_TO_TV.get(str(unknown_override or '').upper())
+    for row in rows:
+        sym = clean_symbol(row.get('ticker'))
+        if not sym or sym in seen: continue
+        seen.add(sym)
+        value = exchange_map.get(sym) or row.get('exchange')
+        exchange = EXCHANGE_TO_TV.get(str(value or '').upper().strip()) or override
+        if not exchange:
+            unresolved.append(sym)
+        else:
+            prefixed.append(f'{exchange}:{tradingview_symbol(sym)}')
+    return ','.join(prefixed), unresolved
+
+
+def parse_exchange_csv(content: bytes) -> dict[str, str]:
+    if len(content) > 1_000_000: raise ValueError('Maximum 1 MB pentru mapa burselor')
+    try:
+        text = content.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        text = content.decode('latin1')
+    reader = csv.DictReader(StringIO(text))
+    if not reader.fieldnames: raise ValueError('CSV gol')
+    colmap = {str(key).lower().strip(): key for key in reader.fieldnames}
+    symbol_col = next((colmap[n] for n in ('symbol','ticker') if n in colmap), None)
+    exch_col = next((colmap[n] for n in ('exchange','exch','venue') if n in colmap), None)
+    if not symbol_col or not exch_col: raise ValueError('CSV trebuie să conțină coloanele Symbol și Exchange')
+    results = {}
+    for row in reader:
+        sym = clean_symbol(row.get(symbol_col))
+        ex = str(row.get(exch_col) or '').strip().upper()
+        if sym and ex in EXCHANGE_TO_TV: results[sym] = ex
+    return results
+
+
+st.set_page_config(page_title='DARVAS RS v9 | Multi-platform Exports',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
 
 BG='#0b1018'; PANEL='#131b26'; GREEN='#27d09a'; MUTED='#a7b9cd'
 STYLE=r"""
@@ -343,7 +490,62 @@ section[data-testid="stSidebar"] [data-testid="stMarkdown"] h3{margin-bottom:4px
 small,[data-testid="stCaptionContainer"]{color:#a8bad0!important}
 [data-testid="stAlert"]{background:#162638!important;color:#e5f2ff!important}
 hr{border-color:#304052}
-/* Consistent readable controls, including light-client dropdown portals. */
+/* v9: Contrast in EVERY state (idle, hover, keyboard focus, selected, disabled). */
+[data-testid="stDownloadButton"] button,
+[data-testid="stButton"] button:not([kind="primary"]),
+[data-testid="stFormSubmitButton"] button:not([kind="primary"]),
+[data-testid="stPopover"] button {
+  background-color:#1b3045!important;color:#edf6ff!important;
+  -webkit-text-fill-color:#edf6ff!important;border:1px solid #4b6b88!important;
+}
+[data-testid="stDownloadButton"] button:hover,
+[data-testid="stDownloadButton"] button:focus-visible,
+[data-testid="stButton"] button:not([kind="primary"]):hover,
+[data-testid="stButton"] button:not([kind="primary"]):focus-visible,
+[data-testid="stFormSubmitButton"] button:not([kind="primary"]):hover,
+[data-testid="stPopover"] button:hover {
+  background-color:#2e4d68!important;color:#fff!important;
+  -webkit-text-fill-color:#fff!important;border-color:#81b0cf!important;
+}
+[data-testid="stDownloadButton"] button:disabled,
+[data-testid="stButton"] button:disabled {
+  background-color:#263444!important;color:#b6c7d7!important;
+  -webkit-text-fill-color:#b6c7d7!important;opacity:.85!important;
+}
+[data-testid="stDownloadButton"] button *,
+[data-testid="stButton"] button * {
+  color:inherit!important;-webkit-text-fill-color:currentColor!important;
+}
+/* BaseWeb select: surface and text must never diverge. */
+[data-baseweb="select"] > div,
+[data-baseweb="select"] > div:hover,
+[data-baseweb="select"] > div:focus-within,
+[data-testid="stSelectbox"] [role="combobox"],
+[data-testid="stSelectbox"] [role="combobox"]:hover,
+[data-testid="stMultiSelect"] [role="combobox"],
+[data-testid="stMultiSelect"] [role="combobox"]:hover {
+ background-color:#1b2c40!important;color:#f4f8ff!important;
+ border-color:#52718d!important;
+}
+[data-baseweb="select"] [aria-selected="true"],
+[data-baseweb="menu"] li[aria-selected="true"],
+[role="listbox"] [role="option"][aria-selected="true"] {
+ background-color:#2a5668!important;color:#fff!important;
+}
+[data-baseweb="menu"] li:hover,
+[role="listbox"] [role="option"]:hover,
+[data-baseweb="menu"] li:focus-visible,
+[role="listbox"] [role="option"]:focus-visible {
+ background-color:#315470!important;color:#fff!important;
+}
+[data-baseweb="menu"] li:hover *,
+[role="listbox"] [role="option"]:hover *,
+[role="listbox"] [role="option"][aria-selected="true"] * {
+ color:#fff!important;-webkit-text-fill-color:#fff!important;
+}
+[data-testid="stDataFrame"]{color:#e7f2fa!important}
+[data-testid="stTabs"] button:hover{color:#fff!important;background:#243a50!important}
+
 </style>"""
 st.markdown(STYLE,unsafe_allow_html=True)
 
@@ -491,12 +693,19 @@ def parse_scores_csv(content:bytes)->tuple[dict[str,dict],str]:
 
 st.markdown('''<div style="display:flex;gap:15px;align-items:center;margin:0 0 5px">
 <div style="font-weight:900;letter-spacing:.11em;font-size:12px;color:#26c98d;border:1px solid #267158;border-radius:5px;padding:4px 8px">DARVAS / RS</div>
-<div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner</div>
+<div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner <span style="font-size:12px;color:#8ac7d8;font-weight:700">v9</span></div>
 </div><div style="color:#aec2d4;margin-bottom:14px">Darvas Breakout · VCP Pre-Breakout · First Pullback EMA 20W · RS vs SPY/SPX · hover charts</div>''',unsafe_allow_html=True)
 
 def _universe_changed():
     # SCTR enforcement follows the selected universe; users may override afterward.
     st.session_state['filter_sctr_on']=st.session_state.get('universe_choice')=='Imported SCTR list'
+    st.session_state.pop('results',None)
+
+def _choose_full_sctr_universe():
+    # Runs as a widget callback before the sidebar selectbox is instantiated.
+    st.session_state['universe_choice']='Imported SCTR list'
+    st.session_state['scan_all_imported_v8']=True
+    st.session_state['filter_sctr_on']=True
     st.session_state.pop('results',None)
 
 with st.sidebar:
@@ -535,6 +744,10 @@ with st.sidebar:
                 as_csv=pd.DataFrame([{'Ticker':t,'SCTR':v['sctr'],'Sector':v.get('sector',''),'Industry':v.get('industry','')} for t,v in pasted.items()])
                 st.download_button('↓ Descarcă SCTR ca CSV',as_csv.to_csv(index=False).encode('utf-8-sig'),file_name='stockcharts_sctr_import.csv',mime='text/csv')
             else:st.warning(pasted_message)
+    if scores and universe!='Imported SCTR list':
+        st.warning(f'{len(scores)} scoruri SCTR importate, dar universul activ este „{universe}”. Nu se scanează automat lista SCTR până nu o selectezi.')
+        st.button('✓ Folosește TOATE tickerele importate SCTR',on_click=_choose_full_sctr_universe,
+            use_container_width=True,key='use_imported_sctr_v9')
     st.caption('SCTR este un snapshot din StockCharts; nu reprezintă date live. Poți relipi tabelul când vrei să îl actualizezi.')
     st.session_state.setdefault('user_profiles', {})
     with st.expander('💾 Profiluri personale · import / export',expanded=False):
@@ -815,7 +1028,7 @@ if submitted:
                 rs=pb_rs
             rs_all[ticker]=rs.get('rs_3m')
         percentiles=annotate_percentile(rs_all)
-        selected=[];rejected_rs=0;rejected_scores=0
+        selected=[];after_rs=[];after_sctr=[];rejected_rs=0;rejected_scores=0
         for r in candidates:
             t=r['ticker'];r['rs_percentile']=percentiles.get(t)
             values=scores.get(t,{})
@@ -823,8 +1036,10 @@ if submitted:
                 r[field]=values.get(field)
             if not passes_rs(r,rs_mode,rs_min,r['rs_percentile'],rs_pctl):
                 rejected_rs+=1;continue
+            after_rs.append(r)
             if sctr_on and (r.get('sctr') is None or r['sctr']<sctr_min):
                 rejected_scores+=1;continue
+            after_sctr.append(r)
             selected.append(r)
         # No market-cap requirements, no automatic cap metadata lookups.
         # Only verify exchange when the user explicitly selected an exchange filter.
@@ -851,6 +1066,10 @@ if submitted:
            'missing':len(tickers)-available,'exchange_rejected':exchange_rejected,
            'mode':mode,'strategy':strategy,'score_info':import_message,
            'technical_candidates':sorted(candidates,key=lambda r:r.get('rs_3m') or -100,reverse=True)[:120],
+           'technical_candidates_all':sorted(candidates,key=lambda r:r.get('rs_3m') or -100,reverse=True),
+           'after_rs':after_rs, 'after_sctr':after_sctr,
+           'universe_snapshot':[{'ticker':sym,'pattern':'Universe','status':'UNIVERSE',
+              **{key:scores.get(sym,{}).get(key) for key in ('sctr','sector','industry')}} for sym in tickers],
            'resistance_basis':rules.resistance_basis,'confirmed_pivot':confirmed_pivot,'lookback':lookback}
 
 if 'results' in st.session_state:
@@ -867,17 +1086,138 @@ if 'results' in st.session_state:
         st.info('No signals match all active filters. Try a broader stage selection, increase the pullback watch tolerance, set RS to Off, widen the VCP range tolerance, or disable the SCTR requirement for a diagnostic scan. These are authentic zero results, not sample tickers.')
     if rows:
         st.iframe(render_results(rows,res['timeframe'],res['benchmark']),height=750,width='stretch')
-        flat=[]
-        for r in rows:
-            flat.append({k:v for k,v in r.items() if k not in ('chart','rs_line','rs_dates')})
-        st.download_button('↓ Download matched tickers & scan metrics (CSV)',pd.DataFrame(flat).to_csv(index=False).encode('utf-8-sig'),
-          file_name=f"darvas_rs_pullback_{res['timeframe'].lower()}_{datetime.now().strftime('%Y%m%d')}.csv",mime='text/csv')
     if res.get('technical_candidates'):
         with st.expander(f"Technical candidate explorer ({res['technical']} setups before RS/SCTR/exchange) · top 120",expanded=False):
             st.caption('Research list BEFORE RS, SCTR or exchange filters. Not actionable signals until verified. Hover/click ticker for the chart.')
             st.iframe(render_results(res['technical_candidates'],res['timeframe'],res['benchmark']),height=560,width='stretch')
-            subset=[{k:v for k,v in r.items() if k not in ('chart','rs_line','rs_dates')} for r in res['technical_candidates']]
-            st.download_button('↓ Export technical candidates CSV',pd.DataFrame(subset).to_csv(index=False).encode('utf-8-sig'),file_name='darvas_candidates.csv',mime='text/csv')
+    # Post-scan exports are independent of the chart's internal client-side search.
+    # Sources represent distinct steps of the SAME completed scan, not reconstructed signals.
+    st.markdown('### 05 · Export Center · TradingView / Deepvue / thinkorswim')
+    st.caption('Alege etapa din screening și rafinează lista; exporturile folosesc același subset. Nu este nevoie să rulezi din nou scanarea. Căutarea internă din tabelul grafic nu modifică exporturile.')
+    export_sources={
+        'Rezultate finale · toate filtrele aplicate':res['data'],
+        'După RS · înainte de SCTR / bursă':res.get('after_rs',[]),
+        'După RS + SCTR · înainte de bursă':res.get('after_sctr',[]),
+        'Candidați tehnici · înainte de RS / SCTR':res.get('technical_candidates_all',res.get('technical_candidates',[])),
+        'Universul selectat · înainte de analiza tehnică':res.get('universe_snapshot',[]),
+    }
+    export_source=st.selectbox('Etapa filtrării pentru export',list(export_sources),
+        key='export_source_v9',help='Poți exporta inclusiv candidații respinși de filtrul RS sau SCTR. Fiecare etapă păstrează numai simboluri reale din scanarea precedentă.')
+    source_records=export_sources[export_source]
+    ex_a,ex_b,ex_c=st.columns([1.1,1.1,1.2])
+    with ex_a:
+        export_status=st.multiselect('Status (gol = toate)',
+            sorted({str(r.get('status')) for r in source_records if r.get('status')}),
+            key='export_status_v9')
+    with ex_b:
+        export_patterns=st.multiselect('Tip de setup (gol = toate)',
+            sorted({pattern_label(r) for r in source_records}),key='export_pattern_v9')
+    with ex_c:
+        export_search=st.text_input('Ticker (opțional)',key='export_search_v9',placeholder='Ex.: ABBV')
+    with st.expander('Filtre suplimentare DOAR pentru export · opțional',expanded=False):
+        st.caption('Aceste praguri se aplică doar listei de export. Nu schimbă strategiile și nu descarcă date noi.')
+        xa,xb,xc,xd=st.columns(4)
+        with xa:
+            on_sctr=st.checkbox('SCTR minim',key='export_sctr_on_v9')
+            export_sctr_min=st.number_input('SCTR ≥',min_value=0,max_value=100,value=70,
+                disabled=not on_sctr,key='export_sctr_floor_v9')
+        with xb:
+            on_rs=st.checkbox('RS 3M minim',key='export_rs_on_v9')
+            export_rs_min=st.number_input('RS 3M ≥ %',min_value=-100.0,max_value=1000.0,
+                value=0.0,disabled=not on_rs,key='export_rs_floor_v9')
+        with xc:
+            on_risk=st.checkbox('Risc maxim',key='export_risk_on_v9')
+            export_risk_max=st.number_input('SL risc ≤ %',min_value=0.0,max_value=100.0,
+                value=16.0,disabled=not on_risk,key='export_risk_ceiling_v9')
+        with xd:
+            on_age=st.checkbox('Vechime semnal',key='export_age_on_v9')
+            export_max_age=st.number_input('Max. lumânări',min_value=0,max_value=100,
+                value=3,disabled=not on_age,key='export_max_age_v9')
+    export_records=filter_rows(source_records,statuses=export_status,patterns=export_patterns,
+        text=export_search,sctr_floor=export_sctr_min if on_sctr else None,
+        rs_floor=export_rs_min if on_rs else None,max_risk=export_risk_max if on_risk else None,
+        max_age=export_max_age if on_age else None)
+    export_tickers=unique_symbols(export_records)
+    st.caption(f'**{len(export_records)} setup-uri** · **{len(export_tickers)} tickere unice** pregătite pentru export · sursă: {export_source} · scanare: {res["asof"]}')
+    if export_records:
+        pframe=pd.DataFrame([{k:r.get(k) for k in ('ticker','pattern','status','signal_date','sctr','rs_3m','risk_pct')} for r in export_records[:100]])
+        with st.expander(f'Previzualizare lista exportată · primele {len(pframe)} rânduri',expanded=False):
+            st.dataframe(pframe,hide_index=True,use_container_width=True)
+    # Per-symbol exchange needs a real lookup or explicit user-supplied mapping.
+    # Missing exchange never gets an assumed NASDAQ or NYSE prefix by default.
+    with st.expander('TradingView: verificare bursă pentru simboluri · opțional',expanded=False):
+        st.caption('TradingView cere EXCHANGE:SYMBOL. Bursele lipsă nu sunt ghicite. Poți verifica din Yahoo sau furniza propriul CSV cu coloanele Symbol,Exchange.')
+        st.session_state.setdefault('tv_exchange_v9',{})
+        st.session_state.setdefault('tv_attempted_v9',[])
+        scan_tag=res['asof']
+        if st.session_state.get('tv_scan_tag_v9')!=scan_tag:
+            st.session_state['tv_exchange_v9']={}
+            st.session_state['tv_attempted_v9']=[]
+            st.session_state['tv_scan_tag_v9']=scan_tag
+        mapping_upload=st.file_uploader('CSV mapări bursă (Symbol,Exchange)',type=['csv'],key='tv_exchange_csv_v9')
+        user_exchanges={}
+        if mapping_upload:
+            try:
+                user_exchanges=parse_exchange_csv(mapping_upload.getvalue())
+                st.caption(f'{len(user_exchanges)} simboluri cu bursă din CSV-ul tău')
+            except ValueError as exc:
+                st.error(str(exc))
+        unknown_override_label=st.selectbox('Pentru burse NECUNOSCUTE',
+            ['Nu atribui automat · omite simbolurile neverificate',
+             'Folosește NASDAQ (alegere manuală)',
+             'Folosește NYSE (alegere manuală)',
+             'Folosește AMEX (alegere manuală)'],key='tv_unknown_override_v9')
+        manual_exchange=(None if unknown_override_label.startswith('Nu atribui')
+            else unknown_override_label.split()[1])
+        verified_map={**st.session_state['tv_exchange_v9'],**user_exchanges}
+        provisional,unresolved=tradingview_txt(export_records,verified_map,None)
+        unresolved_not_attempted=[t for t in unresolved if t not in st.session_state['tv_attempted_v9']]
+        if st.button(f'Verifică până la 80 de burse necunoscute · {len(unresolved_not_attempted)} rămase',
+            disabled=not unresolved_not_attempted,key='tv_verify_v9'):
+            with st.spinner('Verific bursele pentru simbolurile alese; nu estimez bursa...'):
+                to_check=unresolved_not_attempted[:80]
+                found=bulk_exchanges(to_check)
+                st.session_state['tv_exchange_v9'].update(found)
+                st.session_state['tv_attempted_v9'].extend(to_check)
+            st.rerun()
+        st.caption(f'Prefixe verificate/prezente: {len(export_tickers)-len(unresolved)} / {len(export_tickers)} · '
+                   f'Fără bursă confirmată: {len(unresolved)}. Verificarea Yahoo poate fi incompletă sau limitată.')
+        if manual_exchange and unresolved:
+            st.warning(f'Ai ales manual bursa {manual_exchange} pentru {len(unresolved)} simboluri. Verifică simbolurile în TradingView: această opțiune nu confirmă listarea.')
+    verified_map={**st.session_state.get('tv_exchange_v9',{}),**user_exchanges}
+    tv_content,tv_missing=tradingview_txt(export_records,verified_map,manual_exchange)
+    dv_content=deepvue_text(export_records)
+    tos_content=thinkorswim_csv(export_records)
+    export_suffix=re.sub(r'[^a-z0-9]+','_',export_source.split('·')[0].lower()).strip('_')
+    export_date=res['asof'][:10].replace('-','')
+    ctv,cdv,ctos,csvcol=st.columns(4)
+    with ctv:
+        st.download_button('↓ TradingView TXT',tv_content.encode('utf-8'),
+            file_name=f'darvas_{export_suffix}_{export_date}_tradingview.txt',mime='text/plain',
+            use_container_width=True,disabled=not bool(tv_content),key='tv_export_v9')
+        st.caption(f'{len(export_tickers)-len(tv_missing)} din {len(export_tickers)} tickere cu prefix bursă')
+    with cdv:
+        st.download_button('↓ Deepvue TXT',dv_content.encode('utf-8'),
+            file_name=f'darvas_{export_suffix}_{export_date}_deepvue.txt',mime='text/plain',
+            use_container_width=True,disabled=not bool(export_tickers),key='deepvue_export_v9')
+        st.caption('Un ticker pe rând · pentru Add Symbol → Paste')
+    with ctos:
+        st.download_button('↓ thinkorswim CSV',tos_content,
+            file_name=f'darvas_{export_suffix}_{export_date}_thinkorswim.csv',mime='text/csv',
+            use_container_width=True,disabled=not bool(export_tickers),key='tos_export_v9')
+        st.caption('CSV cu o singură coloană: Symbol')
+    with csvcol:
+        st.download_button('↓ Detalii CSV',csv_bytes(export_records),
+            file_name=f'darvas_{export_suffix}_{export_date}_metrics.csv',mime='text/csv',
+            use_container_width=True,disabled=not bool(export_records),key='metrics_export_v9')
+        st.caption('Toate metricile relevante, fără grafice')
+    if tv_missing and not manual_exchange:
+        st.caption(f'TradingView omite {len(tv_missing)} simboluri cu bursă neverificată. '
+                   'Apasă «Verifică bursele» sau încarcă CSV; nu atribui automat NASDAQ.')
+    if dv_content:
+        with st.expander('Deepvue · copiază direct tickerele',expanded=False):
+            st.code(dv_content,language=None)
+            st.caption('În Deepvue: Watchlists → New Watchlist → Add Symbol → lipește tickerele. TXT-ul conține exact lista de mai sus.')
     with st.expander('Scan diagnostics & methodology'):
         st.write(f"Technical setups before RS/SCTR/exchange: **{res['technical']}**. RS rejected **{res['rejected_rs']}**; SCTR rejected **{res['rejected_scores']}**; exchange rejected/unknown **{res['exchange_rejected']}**.")
         st.markdown('**First Pullback 20W MA**: completed WEEKLY candles only; breakout over a previous N-week high, at least several weekly candles of advance, min impulse, no interim pullback to the 20-week MA tolerance zone, a rising MA, and the first near/touch/bounce. WATCH is not a trigger; FIRST TOUCH is a support-test candidate; BOUNCE requires a weekly close above the touch-week high. Entry/stop are reference levels, not filled orders.\n\n**VCP** = a 2-stage contraction proxy: final N-bar range smaller than preceding N-bar range, intrabar true range contracting, optional volume dry-up. Pivot is the high of the FINAL tight range, not the absolute high of the whole base. VCP breakout requires its own smaller confirmation percentage; stop uses a buffer under final contraction low. **Darvas** remains a separate rule family.\n\n**Box range** = (upper − lower) / lower across preceding N bars (wick high/low by default). **Breakout** = completed candle close at least X% above resistance; its candle is excluded from the box. **Close strength** = (close − low) / (high − low) on breakout candle. **Volume** = change vs immediately prior bar. **Initial stop** = box bottom + 33% × box height (long); **risk** uses entry beyond breakout close. **RS 3M** = return of (stock close / benchmark close) ratio over 13 weekly or 63 daily bars. **RS rank** = percentile within downloaded universe (not proprietary SCTR).')
