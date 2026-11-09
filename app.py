@@ -553,7 +553,7 @@ def parse_exchange_csv(content: bytes) -> dict[str, str]:
     return results
 
 
-st.set_page_config(page_title='DARVAS RS v10.2 | SCTR Universe & Strategy Exports',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
+st.set_page_config(page_title='DARVAS RS v10.3 | Simple exports',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
 
 BG='#0b1018'; PANEL='#131b26'; GREEN='#27d09a'; MUTED='#a7b9cd'
 STYLE=r"""
@@ -787,6 +787,64 @@ def bulk_exchanges(symbols:list[str])->dict[str,str|None]:
     return output
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def official_us_exchange_directory() -> dict[str, str]:
+    """NASDAQ Trader's primary US listings, used only to build accurate TradingView prefixes.
+
+    This is a best-effort PUBLIC exchange directory. It never guesses an exchange.
+    """
+    directory: dict[str, str] = {}
+    sources = (
+        ('nasdaq', 'https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt'),
+        ('other', 'https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt'),
+    )
+    for kind, url in sources:
+        try:
+            response=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=7)
+            response.raise_for_status()
+            rows=csv.DictReader(StringIO(response.text),delimiter='|')
+            for item in rows:
+                if item.get('Test Issue')!='N':
+                    continue
+                if kind=='nasdaq':
+                    symbol=str(item.get('Symbol','')).strip().upper()
+                    venue='NASDAQ'
+                else:
+                    symbol=str(item.get('ACT Symbol','')).strip().upper()
+                    venue={'N':'NYSE','A':'AMEX','P':'NYSE Arca'}.get(
+                        str(item.get('Exchange','')).strip().upper())
+                # The original Yahoo symbol representation uses a dash for class shares.
+                symbol=symbol.replace('.', '-')
+                if venue and clean_symbol(symbol):
+                    directory[symbol]=venue
+        except (requests.RequestException,ValueError,UnicodeError,KeyError):
+            continue
+    return directory
+
+
+def simple_scan_export(records, preset, timeframe, asof, exchange_map):
+    """One-click exports of CURRENT FINAL SCAN ONLY; exactly three destinations.
+
+    No additional filter is run and no sample/starter/universe ticker is inserted.
+    Duplicates from multiple technical setups are removed consistently.
+    """
+    unique=unique_symbols(records)
+    verified={key:exchange_map[key] for key in unique if exchange_map.get(key)}
+    tv_content, missing=tradingview_txt(records,verified)
+    dv_content=deepvue_text(records)
+    tos_content=thinkorswim_csv(records)
+    def name(platform, ext):
+        return export_filename(
+            preset=preset,timeframe=timeframe,stage='Rezultate finale',
+            asof=asof,platform=platform,extension=ext)
+    return {
+        'unique':unique,'missing':missing,
+        'tradingview':(tv_content.encode('utf-8'),name('TradingView','txt')),
+        'deepvue':(dv_content.encode('utf-8'),name('Deepvue','txt')),
+        'thinkorswim':(tos_content,name('thinkorswim','csv')),
+    }
+
+
 def guess_column(df:pd.DataFrame,aliases:set[str])->str|None:
     for name in df.columns:
         key=re.sub(r'[^a-z0-9]','',str(name).lower())
@@ -821,7 +879,7 @@ def parse_scores_csv(content:bytes)->tuple[dict[str,dict],str]:
 
 st.markdown('''<div style="display:flex;gap:15px;align-items:center;margin:0 0 5px">
 <div style="font-weight:900;letter-spacing:.11em;font-size:12px;color:#26c98d;border:1px solid #267158;border-radius:5px;padding:4px 8px">DARVAS / RS</div>
-<div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner <span style="font-size:12px;color:#8ac7d8;font-weight:700">v10.2</span></div>
+<div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner <span style="font-size:12px;color:#8ac7d8;font-weight:700">v10.3</span></div>
 </div><div style="color:#aec2d4;margin-bottom:14px">Darvas Breakout · VCP Pre-Breakout · First Pullback EMA 20W · RS vs SPY/SPX · hover charts</div>''',unsafe_allow_html=True)
 
 def _universe_changed():
@@ -1265,167 +1323,60 @@ if 'results' in st.session_state:
         with st.expander(f"Technical candidate explorer ({res['technical']} setups before RS/SCTR/exchange) · top 120",expanded=False):
             st.caption('Research list BEFORE RS, SCTR or exchange filters. Not actionable signals until verified. Hover/click ticker for the chart.')
             st.iframe(render_results(res['technical_candidates'],res['timeframe'],res['benchmark']),height=560,width='stretch')
-    # Post-scan exports are independent of the chart's internal client-side search.
-    # Sources represent distinct steps of the SAME completed scan, not reconstructed signals.
-    st.markdown('### 05 · Export Center · TradingView / Deepvue / thinkorswim')
-    st.caption('Alege etapa din screening și rafinează lista; exporturile folosesc același subset. Nu este nevoie să rulezi din nou scanarea. Căutarea internă din tabelul grafic nu modifică exporturile.')
-    export_sources={
-        'Rezultate finale · toate filtrele aplicate':res['data'],
-        'După RS · înainte de SCTR / bursă':res.get('after_rs',[]),
-        'După RS + SCTR · înainte de bursă':res.get('after_sctr',[]),
-        'Candidați tehnici · înainte de RS / SCTR':res.get('technical_candidates_all',res.get('technical_candidates',[])),
-        'Universul selectat · înainte de analiza tehnică':res.get('universe_snapshot',[]),
-    }
-    export_source=st.selectbox('Etapa filtrării pentru export',list(export_sources),
-        key='export_source_v9',help='Poți exporta inclusiv candidații respinși de filtrul RS sau SCTR. Fiecare etapă păstrează numai simboluri reale din scanarea precedentă.')
-    source_records=export_sources[export_source]
-    ex_a,ex_b,ex_c=st.columns([1.1,1.1,1.2])
-    with ex_a:
-        export_status=st.multiselect('Status (gol = toate)',
-            sorted({str(r.get('status')) for r in source_records if r.get('status')}),
-            key='export_status_v9')
-    with ex_b:
-        export_patterns=st.multiselect('Tip de setup (gol = toate)',
-            sorted({pattern_label(r) for r in source_records}),key='export_pattern_v9')
-    with ex_c:
-        export_search=st.text_input('Ticker (opțional)',key='export_search_v9',placeholder='Ex.: ABBV')
-    with st.expander('Filtre suplimentare DOAR pentru export · opțional',expanded=False):
-        st.caption('Aceste praguri se aplică doar listei de export. Nu schimbă strategiile și nu descarcă date noi.')
-        xa,xb,xc,xd=st.columns(4)
-        with xa:
-            on_sctr=st.checkbox('SCTR minim',key='export_sctr_on_v9')
-            export_sctr_min=st.number_input('SCTR ≥',min_value=0,max_value=100,value=70,
-                disabled=not on_sctr,key='export_sctr_floor_v9')
-        with xb:
-            on_rs=st.checkbox('RS 3M minim',key='export_rs_on_v9')
-            export_rs_min=st.number_input('RS 3M ≥ %',min_value=-100.0,max_value=1000.0,
-                value=0.0,disabled=not on_rs,key='export_rs_floor_v9')
-        with xc:
-            on_risk=st.checkbox('Risc maxim',key='export_risk_on_v9')
-            export_risk_max=st.number_input('SL risc ≤ %',min_value=0.0,max_value=100.0,
-                value=16.0,disabled=not on_risk,key='export_risk_ceiling_v9')
-        with xd:
-            on_age=st.checkbox('Vechime semnal',key='export_age_on_v9')
-            export_max_age=st.number_input('Max. lumânări',min_value=0,max_value=100,
-                value=3,disabled=not on_age,key='export_max_age_v9')
-    export_records=filter_rows(source_records,statuses=export_status,patterns=export_patterns,
-        text=export_search,sctr_floor=export_sctr_min if on_sctr else None,
-        rs_floor=export_rs_min if on_rs else None,max_risk=export_risk_max if on_risk else None,
-        max_age=export_max_age if on_age else None)
-    export_tickers=unique_symbols(export_records)
-    st.caption(f'**{len(export_records)} setup-uri** · **{len(export_tickers)} tickere unice** pregătite pentru export · sursă: {export_source} · scanare: {res["asof"]}')
-    if export_records:
-        pframe=pd.DataFrame([{k:r.get(k) for k in ('ticker','pattern','status','signal_date','sctr','rs_3m','risk_pct')} for r in export_records[:100]])
-        with st.expander(f'Previzualizare lista exportată · primele {len(pframe)} rânduri',expanded=False):
-            st.dataframe(pframe,hide_index=True,use_container_width=True)
-    # Per-symbol exchange needs a real lookup or explicit user-supplied mapping.
-    # Missing exchange never gets an assumed NASDAQ or NYSE prefix by default.
-    with st.expander('TradingView: verificare bursă pentru simboluri · opțional',expanded=False):
-        st.caption('TradingView cere EXCHANGE:SYMBOL. Bursele lipsă nu sunt ghicite. Poți verifica din Yahoo sau furniza propriul CSV cu coloanele Symbol,Exchange.')
-        st.session_state.setdefault('tv_exchange_v9',{})
-        st.session_state.setdefault('tv_attempted_v9',[])
-        scan_tag=res['asof']
-        if st.session_state.get('tv_scan_tag_v9')!=scan_tag:
-            st.session_state['tv_exchange_v9']={}
-            st.session_state['tv_attempted_v9']=[]
-            st.session_state['tv_scan_tag_v9']=scan_tag
-        mapping_upload=st.file_uploader('CSV mapări bursă (Symbol,Exchange)',type=['csv'],key='tv_exchange_csv_v9')
-        user_exchanges={}
-        if mapping_upload:
-            try:
-                user_exchanges=parse_exchange_csv(mapping_upload.getvalue())
-                st.caption(f'{len(user_exchanges)} simboluri cu bursă din CSV-ul tău')
-            except ValueError as exc:
-                st.error(str(exc))
-        unknown_override_label=st.selectbox('Pentru burse NECUNOSCUTE',
-            ['Nu atribui automat · omite simbolurile neverificate',
-             'Folosește NASDAQ (alegere manuală)',
-             'Folosește NYSE (alegere manuală)',
-             'Folosește AMEX (alegere manuală)'],key='tv_unknown_override_v9')
-        manual_exchange=(None if unknown_override_label.startswith('Nu atribui')
-            else unknown_override_label.split()[1])
-        verified_map={**st.session_state['tv_exchange_v9'],**user_exchanges}
-        provisional,unresolved=tradingview_txt(export_records,verified_map,None)
-        unresolved_not_attempted=[t for t in unresolved if t not in st.session_state['tv_attempted_v9']]
-        if st.button(f'Verifică până la 80 de burse necunoscute · {len(unresolved_not_attempted)} rămase',
-            disabled=not unresolved_not_attempted,key='tv_verify_v9'):
-            with st.spinner('Verific bursele pentru simbolurile alese; nu estimez bursa...'):
-                to_check=unresolved_not_attempted[:80]
-                found=bulk_exchanges(to_check)
-                st.session_state['tv_exchange_v9'].update(found)
-                st.session_state['tv_attempted_v9'].extend(to_check)
-            st.rerun()
-        st.caption(f'Prefixe verificate/prezente: {len(export_tickers)-len(unresolved)} / {len(export_tickers)} · '
-                   f'Fără bursă confirmată: {len(unresolved)}. Verificarea Yahoo poate fi incompletă sau limitată.')
-        if manual_exchange and unresolved:
-            st.warning(f'Ai ales manual bursa {manual_exchange} pentru {len(unresolved)} simboluri. Verifică simbolurile în TradingView: această opțiune nu confirmă listarea.')
-    verified_map={**st.session_state.get('tv_exchange_v9',{}),**user_exchanges}
-    tv_content,tv_missing=tradingview_txt(export_records,verified_map,manual_exchange)
-    dv_content=deepvue_text(export_records)
-    tos_content=thinkorswim_csv(export_records)
-    # Native TradingView Watchlist import requires a TXT file with comma-separated
-    # EXCHANGE:SYMBOL entries. CSV is a separate spreadsheet-friendly convenience.
-    tv_csv,tv_csv_missing=tradingview_csv(export_records,verified_map,manual_exchange)
-    assert tv_missing == tv_csv_missing
-    source_stage = (
-        'Rezultate finale' if export_source.startswith('Rezultate finale') else
-        'Dupa RS SCTR' if export_source.startswith('După RS + SCTR') else
-        'Dupa RS' if export_source.startswith('După RS') else
-        'Candidati tehnici' if export_source.startswith('Candidați tehnici') else
-        'Universul selectat'
-    )
-    filename_args=dict(
-        preset=res.get('scan_preset') or res.get('strategy') or 'Darvas Breakout',
-        timeframe=res['timeframe'],stage=source_stage,asof=res['asof'],
-        selected_patterns=(export_patterns or sorted({pattern_label(r) for r in export_records if r.get('pattern')})),
-        selected_statuses=export_status,
-        sctr_floor=export_sctr_min if on_sctr else None,
-        rs_floor=export_rs_min if on_rs else None,
-        max_risk=export_risk_max if on_risk else None,
-        max_age=export_max_age if on_age else None,
-    )
-    st.caption('Numele descărcării include strategia scanată, etapa filtrării, ' 
-               'statusurile și pragurile suplimentare alese, data și platforma.')
-    ctv,ctvc,cdv=st.columns(3)
-    with ctv:
-        st.download_button('↓ TradingView TXT · import direct',tv_content.encode('utf-8'),
-            file_name=export_filename(**filename_args,platform='TradingView',extension='txt'),
+    # Simple one-click exports: CURRENT completed scan results, no extra steps.
+    st.markdown('### 05 · Descarcă rezultatele scanării curente')
+    st.caption('Aceleași tickere care apar în rezultatele de mai sus, după TOATE filtrele strategiei; '
+               'fără filtre suplimentare, fără selectarea unei etape și fără duplicări.')
+
+    if rows:
+        # TradingView needs an exchange prefix. Resolve it automatically from public
+        # primary listing directories, then use Yahoo metadata for remaining symbols.
+        symbols=unique_symbols(rows)
+        directory=official_us_exchange_directory()
+        verified={s:directory.get(s) for s in symbols if directory.get(s)}
+        for row in rows:
+            if row.get('exchange') and row['ticker'] not in verified:
+                verified[row['ticker']]=row['exchange']
+        missing=[s for s in symbols if s not in verified]
+        if missing:
+            verified.update({s:venue for s,venue in bulk_exchanges(missing[:50]).items() if venue})
+        exports=simple_scan_export(
+            rows,res.get('scan_preset') or res.get('strategy') or 'Darvas Breakout',
+            res['timeframe'],res['asof'],verified)
+    else:
+        exports=simple_scan_export([],
+            res.get('scan_preset') or res.get('strategy') or 'Darvas Breakout',
+            res['timeframe'],res['asof'],{})
+
+    number=len(exports['unique'])
+    st.markdown(f'**{number} tickere unice** · Scanare: {res["asof"]}')
+    left,middle,right=st.columns(3)
+    with left:
+        tv_bytes,tv_name=exports['tradingview']
+        st.download_button('↓ TradingView',tv_bytes,file_name=tv_name,
             mime='text/plain',use_container_width=True,
-            disabled=not bool(tv_content),key='tv_export_v10')
-        st.caption(f'{len(export_tickers)-len(tv_missing)} din {len(export_tickers)} tickere cu prefix bursă. ' 
-                   'Watchlist → Upload list… cere TXT, nu CSV.')
-    with ctvc:
-        st.download_button('↓ TradingView CSV · tabel',tv_csv,
-            file_name=export_filename(**filename_args,platform='TradingView',extension='csv'),
-            mime='text/csv',use_container_width=True,
-            disabled=not bool(tv_content),key='tv_csv_export_v10')
-        st.caption('CSV cu o coloană Symbol; pentru Excel / editare, nu import direct în watchlist.')
-    with cdv:
-        st.download_button('↓ Deepvue TXT',dv_content.encode('utf-8'),
-            file_name=export_filename(**filename_args,platform='Deepvue',extension='txt'),
+            disabled=not bool(tv_bytes),key='simple_tv_v103')
+        st.caption('TXT · import direct Watchlist')
+    with middle:
+        dv_bytes,dv_name=exports['deepvue']
+        st.download_button('↓ Deepvue',dv_bytes,file_name=dv_name,
             mime='text/plain',use_container_width=True,
-            disabled=not bool(export_tickers),key='deepvue_export_v10')
-        st.caption('Un ticker pe rând · pentru Add Symbol → Paste')
-    ctos,csvcol=st.columns(2)
-    with ctos:
-        st.download_button('↓ thinkorswim CSV',tos_content,
-            file_name=export_filename(**filename_args,platform='thinkorswim',extension='csv'),
+            disabled=not bool(number),key='simple_dv_v103')
+        st.caption('TXT · un ticker pe rând')
+    with right:
+        tos_bytes,tos_name=exports['thinkorswim']
+        st.download_button('↓ thinkorswim',tos_bytes,file_name=tos_name,
             mime='text/csv',use_container_width=True,
-            disabled=not bool(export_tickers),key='tos_export_v10')
-        st.caption('CSV cu o singură coloană: Symbol')
-    with csvcol:
-        st.download_button('↓ Detalii CSV',csv_bytes(export_records),
-            file_name=export_filename(**filename_args,platform='Metrici',extension='csv'),
-            mime='text/csv',use_container_width=True,
-            disabled=not bool(export_records),key='metrics_export_v10')
-        st.caption('Toate metricile relevante, fără grafice')
-    if tv_missing and not manual_exchange:
-        st.caption(f'TradingView omite {len(tv_missing)} simboluri cu bursă neverificată. '
-                   'Apasă «Verifică bursele» sau încarcă CSV; nu atribui automat NASDAQ.')
-    if dv_content:
-        with st.expander('Deepvue · copiază direct tickerele',expanded=False):
-            st.code(dv_content,language=None)
-            st.caption('În Deepvue: Watchlists → New Watchlist → Add Symbol → lipește tickerele. TXT-ul conține exact lista de mai sus.')
+            disabled=not bool(number),key='simple_tos_v103')
+        st.caption('CSV · coloană Symbol')
+    if exports['missing']:
+        st.warning(f'TradingView: {len(exports["missing"])} din {number} simboluri nu au putut fi '
+                   'asociate unei burse confirmate și NU apar în fișierul TXT. '
+                   'Deepvue și thinkorswim conțin întreaga listă. '
+                   'Simboluri neconfirmate: '+', '.join(exports['missing'][:25])
+                   +('…' if len(exports['missing'])>25 else ''))
+    else:
+        st.caption('TradingView: prefixele burselor sunt verificate pentru toate simbolurile exportate.')
     with st.expander('Scan diagnostics & methodology'):
         st.write(f"Technical setups before RS/SCTR/exchange: **{res['technical']}**. RS rejected **{res['rejected_rs']}**; SCTR rejected **{res['rejected_scores']}**; exchange rejected/unknown **{res['exchange_rejected']}**.")
         st.markdown('**First Pullback 20W MA**: completed WEEKLY candles only; breakout over a previous N-week high, at least several weekly candles of advance, min impulse, no interim pullback to the 20-week MA tolerance zone, a rising MA, and the first near/touch/bounce. WATCH is not a trigger; FIRST TOUCH is a support-test candidate; BOUNCE requires a weekly close above the touch-week high. Entry/stop are reference levels, not filled orders.\n\n**VCP** = a 2-stage contraction proxy: final N-bar range smaller than preceding N-bar range, intrabar true range contracting, optional volume dry-up. Pivot is the high of the FINAL tight range, not the absolute high of the whole base. VCP breakout requires its own smaller confirmation percentage; stop uses a buffer under final contraction low. **Darvas** remains a separate rule family.\n\n**Box range** = (upper − lower) / lower across preceding N bars (wick high/low by default). **Breakout** = completed candle close at least X% above resistance; its candle is excluded from the box. **Close strength** = (close − low) / (high − low) on breakout candle. **Volume** = change vs immediately prior bar. **Initial stop** = box bottom + 33% × box height (long); **risk** uses entry beyond breakout close. **RS 3M** = return of (stock close / benchmark close) ratio over 13 weekly or 63 daily bars. **RS rank** = percentile within downloaded universe (not proprietary SCTR).')
