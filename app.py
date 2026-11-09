@@ -8,6 +8,7 @@ from io import StringIO
 from typing import Iterable, Mapping
 import csv
 import copy
+import hashlib
 import re
 from zoneinfo import ZoneInfo
 
@@ -120,6 +121,59 @@ def select_universe_tickers(universe: str, base_tickers: list[str],
     cap_active=universe!='Imported SCTR list' or not scan_all_imported
     selected=requested[:max(0,int(max_symbols))] if cap_active else requested
     return imported,requested,selected,cap_active
+
+
+def reconcile_sctr_universe_v102(state, signature: str | None) -> bool:
+    """Prefer *all* valid imported SCTR rows on every rerun, not only new pastes.
+
+    A previous 95-stock Starter selection must not mask a 494-row paste. The
+    user can explicitly change the Stock universe selector afterwards; that
+    manual override is retained until a NEW SCTR snapshot is pasted/uploaded.
+    This is a pure, side-effect-free-from-Streamlit helper for regression tests.
+    """
+    previous = state.get('_sctr_snapshot_signature_v102')
+    if not signature:
+        state['_sctr_snapshot_signature_v102'] = None
+        return False
+    if signature != previous:
+        state['_sctr_snapshot_signature_v102'] = signature
+        state['_sctr_manual_override_v102'] = False
+    if state.get('_sctr_manual_override_v102', False):
+        return False
+    changed = (state.get('universe_choice') != 'Imported SCTR list'
+               or state.get('scan_all_imported_v8') is not True
+               or state.get('filter_sctr_on') is not True)
+    state['universe_choice'] = 'Imported SCTR list'
+    state['scan_all_imported_v8'] = True
+    state['filter_sctr_on'] = True
+    if changed:
+        state.pop('results', None)  # Stale Starter scan is not an SCTR scan.
+    return changed
+
+
+def effective_universe_v102(widget_universe: str, imported_sctr_count: int,
+                            manual_override: bool) -> str:
+    """Final backstop: a 494-row import must never silently scan CORE's 95."""
+    if imported_sctr_count > 0 and not manual_override:
+        return 'Imported SCTR list'
+    return widget_universe
+
+
+# Keep old public helper for downstream tests/consumers, but use the robust
+# v10.2 reconciliation in Streamlit instead of this one-shot behavior.
+def activate_imported_sctr_on_new_snapshot(state, signature: str | None) -> bool:
+    previous = state.get('_sctr_snapshot_signature_v101')
+    if not signature:
+        state.pop('_sctr_snapshot_signature_v101', None)
+        return False
+    if signature == previous:
+        return False
+    state['_sctr_snapshot_signature_v101'] = signature
+    state['universe_choice'] = 'Imported SCTR list'
+    state['scan_all_imported_v8'] = True
+    state['filter_sctr_on'] = True
+    state.pop('results', None)
+    return True
 
 
 def recommended_profile(name: str, imported_sctr: bool = False) -> dict:
@@ -405,6 +459,80 @@ def tradingview_txt(records: Iterable[Mapping],
     return ','.join(prefixed), unresolved
 
 
+
+def tradingview_csv(records: Iterable[Mapping],
+                    exchange_map: Mapping[str, str | None] | None = None,
+                    unknown_override: str | None = None) -> tuple[bytes, list[str]]:
+    """Spreadsheet CSV: one Symbol column with verified TradingView venue prefixes.
+
+    Native TradingView WATCHLIST upload requires .txt, not this .csv. This
+    companion download is intended for spreadsheet editing or conversions.
+    """
+    raw, unresolved = tradingview_txt(records, exchange_map, unknown_override)
+    symbols = [value for value in raw.split(',') if value]
+    return csv_bytes(({'Symbol': symbol} for symbol in symbols), ['Symbol']), unresolved
+
+
+def _filename_part(value: object) -> str:
+    """Portable human-readable filename segment; no directory separators."""
+    import unicodedata
+    raw = unicodedata.normalize('NFKD', str(value or ''))
+    raw = raw.encode('ascii', 'ignore').decode('ascii')
+    return re.sub(r'[^A-Za-z0-9]+', '_', raw).strip('_')[:54] or 'Lista'
+
+
+def export_filename(*, preset: str, timeframe: str, stage: str, asof: str,
+                    platform: str, extension: str,
+                    selected_patterns: Iterable[str] = (),
+                    selected_statuses: Iterable[str] = (),
+                    sctr_floor: float | None = None,
+                    rs_floor: float | None = None,
+                    max_risk: float | None = None,
+                    max_age: int | None = None) -> str:
+    """Use the strategy from the completed scan, not the currently selected UI preset."""
+    preset_names = {
+        'Darvas Breakout': 'Darvas_Breakout',
+        'Darvas Box': 'Darvas_Breakout',
+        'VCP Pre-Breakout': 'VCP_PreBreakout',
+        'VCP / Tight Base': 'VCP_PreBreakout',
+        'First Pullback EMA 20W': 'First_Pullback_EMA20W',
+        'First Pullback to 20W MA': 'First_Pullback_EMA20W',
+        'Univers SCTR': 'Univers_SCTR',
+        'Darvas': 'Darvas_Breakout',
+    }
+    patterns = sorted(set(str(x) for x in selected_patterns if x))
+    if stage == 'Universul selectat':
+        strategy = 'Univers_SCTR'
+    elif patterns:
+        names = [preset_names.get(n, _filename_part(n)) for n in patterns]
+        strategy = '_si_'.join(names) if len(names) <= 2 else 'Strategii_Multiple'
+    else:
+        cleaned = str(preset or '').removeprefix('★ ').strip()
+        strategy = preset_names.get(cleaned, _filename_part(cleaned))
+    statuses = sorted(set(_filename_part(x) for x in selected_statuses if x))
+    stage_names = {
+        'Rezultate finale': 'RezultateFinale',
+        'Dupa RS': 'DupaRS',
+        'Dupa RS SCTR': 'DupaRS_SCTR',
+        'Candidati tehnici': 'CandidatiTehnici',
+        'Universul selectat': 'UniversSCTR',
+    }
+    parts = [strategy, _filename_part(timeframe), stage_names.get(stage, _filename_part(stage))]
+    if statuses:
+        parts.append('_si_'.join(statuses) if len(statuses) <= 3 else 'StatusuriMultiple')
+    def number_token(number):
+        return f'{float(number):g}'.replace('-', 'minus').replace('.', 'p')
+    if sctr_floor is not None: parts.append('SCTR' + number_token(sctr_floor))
+    if rs_floor is not None: parts.append('RS' + number_token(rs_floor))
+    if max_risk is not None: parts.append('RiscMax' + number_token(max_risk))
+    if max_age is not None: parts.append('VarstaMax' + str(int(max_age)))
+    date = re.sub('[^0-9]', '', str(asof)[:10])
+    parts.extend([date or 'FaraData', _filename_part(platform)])
+    ext = extension.lower().lstrip('.')
+    if ext not in ('csv', 'txt'): raise ValueError('Unsupported file extension')
+    return '_'.join(parts) + '.' + ext
+
+
 def parse_exchange_csv(content: bytes) -> dict[str, str]:
     if len(content) > 1_000_000: raise ValueError('Maximum 1 MB pentru mapa burselor')
     try:
@@ -425,7 +553,7 @@ def parse_exchange_csv(content: bytes) -> dict[str, str]:
     return results
 
 
-st.set_page_config(page_title='DARVAS RS v9 | Multi-platform Exports',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
+st.set_page_config(page_title='DARVAS RS v10.2 | SCTR Universe & Strategy Exports',page_icon='📈',layout='wide',initial_sidebar_state='expanded')
 
 BG='#0b1018'; PANEL='#131b26'; GREEN='#27d09a'; MUTED='#a7b9cd'
 STYLE=r"""
@@ -693,20 +821,47 @@ def parse_scores_csv(content:bytes)->tuple[dict[str,dict],str]:
 
 st.markdown('''<div style="display:flex;gap:15px;align-items:center;margin:0 0 5px">
 <div style="font-weight:900;letter-spacing:.11em;font-size:12px;color:#26c98d;border:1px solid #267158;border-radius:5px;padding:4px 8px">DARVAS / RS</div>
-<div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner <span style="font-size:12px;color:#8ac7d8;font-weight:700">v9</span></div>
+<div style="font-weight:800;font-size:30px;letter-spacing:-.04em;color:#e8f3fd">Breakout Scanner <span style="font-size:12px;color:#8ac7d8;font-weight:700">v10.2</span></div>
 </div><div style="color:#aec2d4;margin-bottom:14px">Darvas Breakout · VCP Pre-Breakout · First Pullback EMA 20W · RS vs SPY/SPX · hover charts</div>''',unsafe_allow_html=True)
 
 def _universe_changed():
-    # SCTR enforcement follows the selected universe; users may override afterward.
-    st.session_state['filter_sctr_on']=st.session_state.get('universe_choice')=='Imported SCTR list'
+    # ONLY this explicit selector action can override the imported-SCTR default.
+    choice=st.session_state.get('universe_choice')
+    st.session_state['_sctr_manual_override_v102'] = choice != 'Imported SCTR list'
+    st.session_state['filter_sctr_on'] = choice == 'Imported SCTR list'
     st.session_state.pop('results',None)
 
 def _choose_full_sctr_universe():
     # Runs as a widget callback before the sidebar selectbox is instantiated.
+    st.session_state['_sctr_manual_override_v102'] = False
     st.session_state['universe_choice']='Imported SCTR list'
     st.session_state['scan_all_imported_v8']=True
     st.session_state['filter_sctr_on']=True
     st.session_state.pop('results',None)
+
+
+def _current_sctr_snapshot_signature() -> str | None:
+    """Read uploads already held in session state BEFORE universe widget."""
+    sources=[]
+    pasted_text=st.session_state.get('sctr_pasted','')
+    if isinstance(pasted_text,str) and pasted_text.strip():
+        parsed,_=parse_sctr_paste(pasted_text)
+        if any('sctr' in entry for entry in parsed.values()):
+            sources.append('text:'+hashlib.sha256(pasted_text.encode('utf-8')).hexdigest())
+    uploaded_csv=st.session_state.get('sctr_csv_upload_v101')
+    if uploaded_csv is not None:
+        contents=uploaded_csv.getvalue()
+        parsed,_=parse_scores_csv(contents)
+        if any('sctr' in entry for entry in parsed.values()):
+            sources.append('csv:'+hashlib.sha256(contents).hexdigest())
+    return '|'.join(sources) if sources else None
+
+
+# Important: reconcile on EVERY rerun BEFORE the Stock universe widget exists.
+# v10.1 only reconciled ONCE on a fresh paste, and hence could scan 95 Starter
+# tickers even while a valid 494-ticker StockCharts paste remained visible.
+reconcile_sctr_universe_v102(
+    st.session_state,_current_sctr_snapshot_signature())
 
 with st.sidebar:
     st.header('Data & universe')
@@ -726,7 +881,7 @@ with st.sidebar:
         help='Limitează universul doar când opțiunea de scanare completă SCTR este oprită; în rest se aplică universurilor implicite/custom.')
     st.divider()
     st.subheader('StockCharts · SCTR')
-    score_upload=st.file_uploader('CSV with ticker + SCTR (optional sector / industry)',type=['csv'],help='Optional CSV exported from StockCharts. Alternatively paste the public SCTR table below.')
+    score_upload=st.file_uploader('CSV with ticker + SCTR (optional sector / industry)',type=['csv'],key='sctr_csv_upload_v101',help='Optional CSV exported from StockCharts. Alternatively paste the public SCTR table below.')
     scores={};import_message=''
     if score_upload:
         scores,import_message=parse_scores_csv(score_upload.getvalue())
@@ -745,7 +900,7 @@ with st.sidebar:
                 st.download_button('↓ Descarcă SCTR ca CSV',as_csv.to_csv(index=False).encode('utf-8-sig'),file_name='stockcharts_sctr_import.csv',mime='text/csv')
             else:st.warning(pasted_message)
     if scores and universe!='Imported SCTR list':
-        st.warning(f'{len(scores)} scoruri SCTR importate, dar universul activ este „{universe}”. Nu se scanează automat lista SCTR până nu o selectezi.')
+        st.warning(f'{len(scores)} scoruri SCTR importate, dar ai ales manual universul „{universe}”. Vor fi scanate numai simbolurile din acel univers.')
         st.button('✓ Folosește TOATE tickerele importate SCTR',on_click=_choose_full_sctr_universe,
             use_container_width=True,key='use_imported_sctr_v9')
     st.caption('SCTR este un snapshot din StockCharts; nu reprezintă date live. Poți relipi tabelul când vrei să îl actualizezi.')
@@ -954,21 +1109,40 @@ if breakout_min>breakout_max:
     st.error('Breakout MIN cannot exceed MAX.')
     st.stop()
 
+# Defensive scan-time resolution, independent from UI widget lifecycle.
+# Even if Streamlit restores an outdated 95-stock Starter widget value, do
+# not silently scan it while a valid SCTR import is present unless the user
+# explicitly selected that other universe using the Stock universe selector.
+imported_now=sum(1 for v in scores.values() if isinstance(v,dict) and 'sctr' in v)
+resolved_universe=effective_universe_v102(
+    universe, imported_now,
+    bool(st.session_state.get('_sctr_manual_override_v102', False)))
+if resolved_universe=='Imported SCTR list' and imported_now:
+    scan_all_imported=True
+if resolved_universe!=universe:
+    st.info(f'Universul de scanare a fost corectat automat din {universe} ({len(CORE)} Starter) în Imported SCTR list ({imported_now} tickere).')
+    st.session_state.pop('results',None)
+universe=resolved_universe
 base=get_universe(universe)
 extra=parse_tickers(ticker_text)
 imported_sctr_tickers,requested_tickers,tickers,cap_active=select_universe_tickers(
     universe,base,extra,scores,int(max_symbols),scan_all_imported)
 sctr_eligible=sum(1 for t in tickers if scores.get(t,{}).get('sctr',-1)>=sctr_min)
 if universe=='Imported SCTR list':
-    st.caption(f'**StockCharts importate: {len(imported_sctr_tickers)}** · **De scanat: {len(tickers)}**'
+    st.markdown(f'**✓ SCTR IMPORTAT: {len(imported_sctr_tickers)} tickere · SCANARE PROGRAMATĂ: {len(tickers)} tickere · Limita Starter de 95 NU se aplică.**')
+    st.caption(f'**Univers activ: Imported SCTR list** · **StockCharts importate: {len(imported_sctr_tickers)}** · **De scanat: {len(tickers)}**'
                + (f' · **SCTR ≥{sctr_min}: {sctr_eligible}** (filtru final activ)' if sctr_on
                   else ' · Filtrul SCTR minim este dezactivat')
                + (' · **Listă integrală, fără limită de tickere**' if scan_all_imported
                   else f' · Limită aplicată: {int(max_symbols)} tickere')
                + ' · Dacă SCTR elimină multe simboluri, ele au fost totuși importate.')
 else:
-    st.caption(f'**Univers inițial: {len(requested_tickers)}** · **De scanat: {len(tickers)}**'
+    st.caption(f'**Univers activ: {universe}** · **Univers inițial: {len(requested_tickers)}** · **De scanat: {len(tickers)}**'
                + (f' · Limită: {int(max_symbols)}' if cap_active else ''))
+    if imported_sctr_tickers:
+        st.warning(f'⚠ Ai {len(imported_sctr_tickers)} simboluri SCTR importate, dar scannerul folosește „{universe}” ({len(tickers)} simboluri).')
+        st.button('✓ Scanează toate simbolurile SCTR importate',
+                  on_click=_choose_full_sctr_universe,key='use_imported_sctr_main_v101')
 st.caption('RS = raport (stock / benchmark) · 3M = 13 lumânări Weekly / 63 Daily. '
            'Countul SCTR este distinct de universul trecut la analiza OHLCV.')
 if submitted:
@@ -1060,6 +1234,7 @@ if submitted:
         priority={'BOUNCE CONFIRMED':5,'FIRST MA TOUCH':4,'BREAKOUT':3,'PRE-BREAKOUT':2,'PULLBACK WATCH':1,'IN BOX':0}
         selected.sort(key=lambda r:(priority.get(r['status'],0),r.get('rs_percentile') or -100,r.get('rs_3m') or -100),reverse=True)
         st.session_state['results']={'data':selected,'timeframe':timeframe,'benchmark':benchmark,
+           'scan_preset':preset_name,
            'asof':datetime.now(ZoneInfo('Europe/Bucharest')).strftime('%Y-%m-%d %H:%M Europe/Bucharest'),
            'requested':len(tickers),'available':available,'technical':len(candidates),
            'rejected_rs':rejected_rs,'rejected_scores':rejected_scores,
@@ -1188,28 +1363,61 @@ if 'results' in st.session_state:
     tv_content,tv_missing=tradingview_txt(export_records,verified_map,manual_exchange)
     dv_content=deepvue_text(export_records)
     tos_content=thinkorswim_csv(export_records)
-    export_suffix=re.sub(r'[^a-z0-9]+','_',export_source.split('·')[0].lower()).strip('_')
-    export_date=res['asof'][:10].replace('-','')
-    ctv,cdv,ctos,csvcol=st.columns(4)
+    # Native TradingView Watchlist import requires a TXT file with comma-separated
+    # EXCHANGE:SYMBOL entries. CSV is a separate spreadsheet-friendly convenience.
+    tv_csv,tv_csv_missing=tradingview_csv(export_records,verified_map,manual_exchange)
+    assert tv_missing == tv_csv_missing
+    source_stage = (
+        'Rezultate finale' if export_source.startswith('Rezultate finale') else
+        'Dupa RS SCTR' if export_source.startswith('După RS + SCTR') else
+        'Dupa RS' if export_source.startswith('După RS') else
+        'Candidati tehnici' if export_source.startswith('Candidați tehnici') else
+        'Universul selectat'
+    )
+    filename_args=dict(
+        preset=res.get('scan_preset') or res.get('strategy') or 'Darvas Breakout',
+        timeframe=res['timeframe'],stage=source_stage,asof=res['asof'],
+        selected_patterns=(export_patterns or sorted({pattern_label(r) for r in export_records if r.get('pattern')})),
+        selected_statuses=export_status,
+        sctr_floor=export_sctr_min if on_sctr else None,
+        rs_floor=export_rs_min if on_rs else None,
+        max_risk=export_risk_max if on_risk else None,
+        max_age=export_max_age if on_age else None,
+    )
+    st.caption('Numele descărcării include strategia scanată, etapa filtrării, ' 
+               'statusurile și pragurile suplimentare alese, data și platforma.')
+    ctv,ctvc,cdv=st.columns(3)
     with ctv:
-        st.download_button('↓ TradingView TXT',tv_content.encode('utf-8'),
-            file_name=f'darvas_{export_suffix}_{export_date}_tradingview.txt',mime='text/plain',
-            use_container_width=True,disabled=not bool(tv_content),key='tv_export_v9')
-        st.caption(f'{len(export_tickers)-len(tv_missing)} din {len(export_tickers)} tickere cu prefix bursă')
+        st.download_button('↓ TradingView TXT · import direct',tv_content.encode('utf-8'),
+            file_name=export_filename(**filename_args,platform='TradingView',extension='txt'),
+            mime='text/plain',use_container_width=True,
+            disabled=not bool(tv_content),key='tv_export_v10')
+        st.caption(f'{len(export_tickers)-len(tv_missing)} din {len(export_tickers)} tickere cu prefix bursă. ' 
+                   'Watchlist → Upload list… cere TXT, nu CSV.')
+    with ctvc:
+        st.download_button('↓ TradingView CSV · tabel',tv_csv,
+            file_name=export_filename(**filename_args,platform='TradingView',extension='csv'),
+            mime='text/csv',use_container_width=True,
+            disabled=not bool(tv_content),key='tv_csv_export_v10')
+        st.caption('CSV cu o coloană Symbol; pentru Excel / editare, nu import direct în watchlist.')
     with cdv:
         st.download_button('↓ Deepvue TXT',dv_content.encode('utf-8'),
-            file_name=f'darvas_{export_suffix}_{export_date}_deepvue.txt',mime='text/plain',
-            use_container_width=True,disabled=not bool(export_tickers),key='deepvue_export_v9')
+            file_name=export_filename(**filename_args,platform='Deepvue',extension='txt'),
+            mime='text/plain',use_container_width=True,
+            disabled=not bool(export_tickers),key='deepvue_export_v10')
         st.caption('Un ticker pe rând · pentru Add Symbol → Paste')
+    ctos,csvcol=st.columns(2)
     with ctos:
         st.download_button('↓ thinkorswim CSV',tos_content,
-            file_name=f'darvas_{export_suffix}_{export_date}_thinkorswim.csv',mime='text/csv',
-            use_container_width=True,disabled=not bool(export_tickers),key='tos_export_v9')
+            file_name=export_filename(**filename_args,platform='thinkorswim',extension='csv'),
+            mime='text/csv',use_container_width=True,
+            disabled=not bool(export_tickers),key='tos_export_v10')
         st.caption('CSV cu o singură coloană: Symbol')
     with csvcol:
         st.download_button('↓ Detalii CSV',csv_bytes(export_records),
-            file_name=f'darvas_{export_suffix}_{export_date}_metrics.csv',mime='text/csv',
-            use_container_width=True,disabled=not bool(export_records),key='metrics_export_v9')
+            file_name=export_filename(**filename_args,platform='Metrici',extension='csv'),
+            mime='text/csv',use_container_width=True,
+            disabled=not bool(export_records),key='metrics_export_v10')
         st.caption('Toate metricile relevante, fără grafice')
     if tv_missing and not manual_exchange:
         st.caption(f'TradingView omite {len(tv_missing)} simboluri cu bursă neverificată. '
